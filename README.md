@@ -268,7 +268,7 @@ None of the above blocks personal use, local research, or the API as shipped (un
 
 ## Roadmap
 
-Not currently planned: WSB/Reddit sentiment, Twitter/X data (API now paid). Corporate jet flight tracking shipped as Phase 20 — the "FAA coverage shrinking" objection that had it shelved turned out to be aimed at the wrong half: Section 803 withholding applies to individual owners, not the corporate registrants this phase filters for. The real coverage ceiling is trust/LLC ownership opacity, which predates it (see Known Limitations). Full phase-by-phase implementation notes, live-run numbers, and every gotcha found along the way live in the project wiki.
+Not currently planned: WSB/Reddit sentiment, Twitter/X data (API now paid). The real coverage ceiling is trust/LLC ownership opacity, which predates it (see Known Limitations). Full phase-by-phase implementation notes, live-run numbers, and every gotcha found along the way live in the project wiki.
 
 ## License
 
