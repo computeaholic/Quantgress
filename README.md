@@ -6,9 +6,9 @@
 ![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)
 ![Data](https://img.shields.io/badge/data-public%20domain-brightgreen.svg)
 
-**A self-hosted, open-source alternative to Quiver Quantitative.** Congressional stock trading disclosures plus 15 adjacent public-data feeds (lobbying, insider trades, 13F holdings, short volume, patents, campaign donations, executive pay, net worth, and more), scraped from primary government sources, normalized into a single [DuckDB](https://duckdb.org/) file, and served over a read-only REST API.
+**A self-hosted, open-source alternative to Quiver Quantitative.** Congressional stock trading disclosures plus 16 adjacent public-data feeds (lobbying, insider trades, 13F holdings, short volume, patents, campaign donations, executive pay, net worth, corporate jet movements, and more), scraped from primary government sources, normalized into a single [DuckDB](https://duckdb.org/) file, and served over a read-only REST API.
 
-Every dataset here is public U.S. government or public-domain disclosure data: SEC, Senate/House ethics offices, FEC, FINRA, USAspending, USPTO, Wikimedia. Nothing is scraped from a paid or access-controlled source.
+Every dataset here is public U.S. government or public-domain disclosure data: SEC, Senate/House ethics offices, FEC, FINRA, USAspending, USPTO, Wikimedia, FAA. Nothing is scraped from a paid source. One feed — OpenSky flight history, Phase 20 — is free but account-gated; it is the only non-government dependency in the project, and the only one that will not run anonymously.
 
 ```
 py q.py "SELECT tkr, count(*) AS n, sum(amount_low) AS min_dollars
@@ -67,6 +67,7 @@ The project was scoped originally against congressional trades (Senate + House P
 | 17 | Donald Trump 278-T trades | [ProPublica DocumentCloud mirror](https://projects.propublica.org/trump-team-financial-disclosures/) | none | manual | `scrape_trump.py` |
 | 18 | Senate Annual Financial Disclosure (accurate net worth) | efdsearch.senate.gov | session only | annual | `scrape_senate_annual.py` |
 | 19 | House Annual Financial Disclosure (accurate net worth) | disclosures-clerk.house.gov | none (UA header) | annual | `scrape_house_annual.py` |
+| 20 | Corporate jet registry + flight history | [FAA Releasable Aircraft DB](https://www.faa.gov/licenses_certificates/aircraft_certification/aircraft_registry/releasable_aircraft_download) + [OpenSky](https://opensky-network.org/) | none / OAuth2 client | monthly / daily | `scrape_flights.py` |
 
 Every scraper is independently runnable, resumable (safe to `Ctrl-C` and re-run), and ships with a `--selftest` flag that validates its parsing logic offline against captured sample data — no network call required.
 
@@ -122,10 +123,11 @@ Quantgress/
 ├── scrape_trump.py            # Phase 17 — Trump OGE 278-T trades
 ├── scrape_senate_annual.py    # Phase 18 — Senate Annual Financial Disclosure
 ├── scrape_house_annual.py     # Phase 19 — House Annual Financial Disclosure
+├── scrape_flights.py          # Phase 20 — FAA aircraft registry + OpenSky flights
 ├── q.py                       # query helper (sidesteps PowerShell quoting issues)
 ├── congress_trades.duckdb     # the database (gitignored in a production checkout)
 ├── requirements.txt
-└── .env                       # USPTO_API_KEY / FEC_API_KEY (gitignored)
+└── .env                       # USPTO / FEC / OpenSky credentials (gitignored)
 ```
 
 ## Getting Started
@@ -143,16 +145,18 @@ cd Quantgress
 py -m pip install -r requirements.txt
 ```
 
-### API keys (optional, only needed for Phases 12 & 13)
+### API keys (optional, only needed for Phases 12, 13 & 20)
 
-Every other dataset needs no key — either a fully open endpoint or a descriptive `User-Agent`. Patents (USPTO) and corporate donations (OpenFEC) need a free key each. Create a `.env` file in the project root:
+Every other dataset needs no key — either a fully open endpoint or a descriptive `User-Agent`. Patents (USPTO), corporate donations (OpenFEC), and the flight-history half of Phase 20 (OpenSky) each need free credentials. Create a `.env` file in the project root:
 
 ```
 USPTO_API_KEY=<from data.uspto.gov, requires ID.me verification>
 FEC_API_KEY=<from api.data.gov/signup, instant>
+OPENSKY_CLIENT_ID=<from opensky-network.org/my-opensky, instant>
+OPENSKY_CLIENT_SECRET=<same page>
 ```
 
-Both scrapers still run `--selftest` with no key or network access at all.
+All three scrapers still run `--selftest` with no key or network access at all. Phase 20's registry half (`--registry`) needs no credentials either — only `--flights` does, and OpenSky rejects anonymous requests to it outright with a 403.
 
 ## Quick Start
 
@@ -248,7 +252,8 @@ Every dataset scraped here is public government or public-domain disclosure data
 
 - **Corporate/PAC donations (`corporate_donations`)** — 52 U.S.C. § 30111(a)(4) bars commercial use or solicitation of individual FEC contributor data. `api.py` only ever serves `corporate_donations_agg`, a pre-aggregated view with `contributor_name` and `sub_id` stripped out entirely — no individual donor is identifiable through the API.
 - **Off-exchange short volume (`short_volume`)** — FINRA's site-wide Terms of Use bar bulk scraping and commercial redistribution; its own API terms bar building a competing product with the data. Currently unresolved whether the daily short-volume catalog's "public dissemination" framing carries a looser license. **Treat this dataset as personal/research use only until confirmed otherwise directly with FINRA.**
-- Every other dataset (SEC EDGAR, USAspending, USPTO, LDA.gov, Senate/House disclosures, Wikimedia) is unrestricted public-domain U.S. government data.
+- **Corporate jet flights (`flights`)** — the FAA registry half is public domain like everything else, but OpenSky is a volunteer-fed community network, not a government source, and its data is free for **non-commercial and research use only**. `api.py` exposes the `corp_flights` view rather than the raw `flights` table, so a response always carries the owner a movement is attributable to instead of being a redistributable dump of OpenSky's feed. If the paid API tiers ever ship, this route needs the same scrutiny the FINRA and FEC ones got.
+- Every other dataset (SEC EDGAR, USAspending, USPTO, LDA.gov, FAA, Senate/House disclosures, Wikimedia) is unrestricted public-domain U.S. government data.
 
 None of the above blocks personal use, local research, or the API as shipped (unauthenticated, `127.0.0.1`-only). It matters only if this is ever exposed publicly or monetized.
 
@@ -258,11 +263,12 @@ None of the above blocks personal use, local research, or the API as shipped (un
 - **Net worth figures are floor estimates, not real holdings.** Disclosures only ever give a dollar bracket, never a share count — `networth.py`'s default mode sums bracket floors, marked to live prices. `networth.py --annual` (Phase 18, Senate only) is materially more accurate: real Dec-31 asset/liability snapshots from Annual Financial Disclosure Reports, not inferred from trade brackets.
 - **Entity resolution coverage is genuinely low for four datasets** (lobbying, contracts, patents, donors) — 2–7% of distinct names match a public ticker on the first pass, by design: most lobbying clients, contract recipients, patent assignees, and donors are private companies, government bodies, or associations with no ticker to have.
 - **No `con.close()` in every scraper** (in progress). A completed run's data can sit WAL-only until the connection is cleanly closed. Don't delete a `.duckdb.wal` file without checking whether it holds unflushed data first.
+- **Corporate jet ownership is deliberately obscured, and the registry is the weaker half of Phase 20.** Of 24,662 company-registered jets, the single largest registrant is `BANK OF UTAH TRUSTEE` (1,293 airframes), followed by two more ownership-anonymizing trusts — a jet held through a trust or a shell LLC has no public link back to the operating company, so `entities.py` resolves only ~4,900 airframes across 108 names to a ticker. Separately, [Section 803 of the FAA Reauthorization Act of 2024](https://www.faa.gov/licenses_certificates/aircraft_certification/aircraft_registry/withhold_ownership_data) lets owners request their details be withheld; it covers the PII of **individual** owners, which Phase 20's corporate-registrant filter already excludes, so it should not erode this table directly — but watch it.
 - **Trump 278-T data is OCR'd from scanned forms**, not born-digital text. Query `trump_trades_clean`, not the raw `trump_trades` table, unless specifically auditing the parse. The clean view filters out rows with detectable OCR corruption.
 
 ## Roadmap
 
-Not currently planned: WSB/Reddit sentiment, Twitter/X data (API now paid), corporate jet flight tracking (FAA coverage shrinking), House Annual Financial Disclosure (PDF-based, same difficulty class as House PTRs). Full phase-by-phase implementation notes, live-run numbers, and every gotcha found along the way live in the project wiki.
+Not currently planned: WSB/Reddit sentiment, Twitter/X data (API now paid). Corporate jet flight tracking shipped as Phase 20 — the "FAA coverage shrinking" objection that had it shelved turned out to be aimed at the wrong half: Section 803 withholding applies to individual owners, not the corporate registrants this phase filters for. The real coverage ceiling is trust/LLC ownership opacity, which predates it (see Known Limitations). Full phase-by-phase implementation notes, live-run numbers, and every gotcha found along the way live in the project wiki.
 
 ## License
 

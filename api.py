@@ -153,6 +153,21 @@ RELATIONS = {
         ("chamber", "eq"), ("last_name", "ilike"), ("creditor", "ilike"),
         ("filing_year", "eq"),
     ], "filed_date DESC"),
+    # Phase 20. `aircraft` is the FAA registry half (public domain, safe to
+    # serve). `corp-flights` is the view, not the raw `flights` table, so a
+    # response always carries the owner the flight is attributable to -- a bare
+    # icao24/timestamp list is both useless to a caller and the shape closest to
+    # redistributing OpenSky's feed. OpenSky is free for non-commercial use
+    # only; if Quantgress API Monetization's paid tiers ever ship, this route
+    # needs the same look the FINRA and FEC ones got.
+    "aircraft": ("aircraft", [
+        ("owner_name", "ilike"), ("n_number", "eq_ci"), ("icao24", "eq_ci"),
+        ("state", "eq_ci"), ("owner_ticker_guess", "eq_ci"),
+    ], "year_mfr DESC"),
+    "corp-flights": ("corp_flights", [
+        ("owner_name", "ilike"), ("tkr", "eq_ci"), ("n_number", "eq_ci"),
+        ("dep_airport", "eq_ci"), ("arr_airport", "eq_ci"),
+    ], "departed DESC"),
 }
 
 

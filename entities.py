@@ -145,6 +145,16 @@ SOURCES = [
     dict(table="corporate_donations", name_col="contributor_name", real_col=None,
          guess_col="contributor_ticker_guess", how_col="contributor_ticker_guess_how",
          extra_where=None, kind="sec_name"),
+    # Phase 20: owner_name is the FAA registrant on the aircraft's registration
+    # -- a bare company name like "EXXON MOBIL CORP", so the same sec_name shape
+    # as lobbying/contracts/patents. Expect a low hit rate anyway: the single
+    # most common registrant class is an ownership-anonymizing trust ("BANK OF
+    # UTAH TRUSTEE", 1,293 airframes), and a jet held through a shell LLC has no
+    # public link to the operating company at all. An unmatched name is dropped,
+    # never guessed, so those stay NULL rather than wrong.
+    dict(table="aircraft", name_col="owner_name", real_col=None,
+         guess_col="owner_ticker_guess", how_col="owner_ticker_guess_how",
+         extra_where=None, kind="sec_name"),
 ]
 
 
