@@ -12,11 +12,13 @@ cron silently ignores any `/etc/cron.d` file with group/other write permission �
 
 | File | Phases | Cadence |
 |---|---|---|
-| `quantgress-daily` | 1-3 (`daily.py`), 11 (`scrape_short_volume.py`), 9 (`scrape_insiders.py`) | daily, staggered 15 min apart |
+| `quantgress-daily` | 1-3 (`daily.py`), 11 (`scrape_short_volume.py`), 9 (`scrape_insiders.py`), 21 (`scrape_wsb.py`) | daily, staggered 15 min apart |
 | `quantgress-weekly` | 7 (`scrape_contracts.py`), 12 (`scrape_patents.py`) | weekly, Sunday |
 | `quantgress-quarterly` | 10 (`scrape_13f.py`), 6 (`scrape_lobbying.py`) | quarterly (Jan/Apr/Jul/Oct 1st) |
 | `quantgress-annual` | 13 (`scrape_donors.py`), 16 (`scrape_execcomp.py`), 18 (`scrape_senate_annual.py`) | annual (Jan 2nd) |
 | `quantgress-annual` | 19 (`scrape_house_annual.py`) | annual (Sep 2nd — after the August filing-extension deadline) |
+
+**Phase 21 (`scrape_wsb.py`) is the one line here that genuinely can't be skipped.** Reddit's `/new` listing only pages back ~1000 posts, which on r/wallstreetbets is about two days — a longer gap is not recoverable from that endpoint at all, unlike every other phase here, which either re-walks a full index or gap-fills from a dated archive. It runs last (`:45`) because it is also the slowest: FinBERT scores every new post on CPU.
 
 **Phase 17 (`scrape_trump.py`) has no cron file, deliberately.** ProPublica's DocumentCloud mirror for Trump's OGE 278-T filings has no fixed publication schedule — there's no real cadence to key a cron line off of. Run it manually (`py scrape_trump.py`) until a pattern in update frequency emerges.
 

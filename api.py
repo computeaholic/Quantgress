@@ -168,6 +168,15 @@ RELATIONS = {
         ("owner_name", "ilike"), ("tkr", "eq_ci"), ("n_number", "eq_ci"),
         ("dep_airport", "eq_ci"), ("arr_airport", "eq_ci"),
     ], "departed DESC"),
+    # Phase 21. An attention dataset like `pageviews`, served the same way and
+    # with the same caveat: it is not a signal, and this project's own
+    # backtesting of exactly this data lost money. Reddit content is never
+    # stored or served -- `wsb_mentions` holds daily per-ticker counts only,
+    # no post text, no usernames, no post ids (those stay in `wsb_posts`,
+    # which is an internal dedupe log and deliberately not routed).
+    "wsb-mentions": ("wsb_mentions", [
+        ("ticker", "eq_ci"), ("date", "eq"),
+    ], "date DESC, mention_count DESC"),
 }
 
 

@@ -9,3 +9,7 @@ fastapi
 uvicorn
 httpx
 slowapi
+# Phase 21 sentiment only (scrape_wsb.py) -- lazily imported, skip both if you
+# only ever run it with --no-sentiment. torch is ~2GB installed.
+transformers
+torch
