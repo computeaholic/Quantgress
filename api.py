@@ -144,12 +144,14 @@ RELATIONS = {
     "trump-trades": ("trump_trades_clean", [
         ("tx_type", "eq_ci"), ("asset_class", "eq_ci"), ("description", "ilike"),
     ], "txn_date DESC"),
+    # both chambers since Phase 19 -- filter with chamber=S / chamber=H
     "senate-assets": ("fd_assets", [
-        ("last_name", "ilike"), ("asset_name", "ilike"),
+        ("chamber", "eq"), ("last_name", "ilike"), ("asset_name", "ilike"),
         ("ticker", "eq_ci"), ("filing_year", "eq"),
     ], "filed_date DESC"),
     "senate-liabilities": ("fd_liabilities", [
-        ("last_name", "ilike"), ("creditor", "ilike"), ("filing_year", "eq"),
+        ("chamber", "eq"), ("last_name", "ilike"), ("creditor", "ilike"),
+        ("filing_year", "eq"),
     ], "filed_date DESC"),
 }
 

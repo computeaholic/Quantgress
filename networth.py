@@ -37,13 +37,13 @@ Usage:
     py networth.py                    # full run, every net-positive ticker
     py networth.py --member Pelosi    # one politician's ticker breakdown
 
---annual switches to Phase 18's accurate mode -- real net worth (assets
-minus liabilities) from each senator's Annual Financial Disclosure Report
-(scrape_senate_annual.py), not a floor reconstructed from PTR trades alone.
-Senate only, since that scraper is Senate-only; a --member outside the
-Senate returns nothing here even if they have PTR-derived numbers above.
+--annual switches to the accurate mode -- real net worth (assets minus
+liabilities) from each member's Annual Financial Disclosure Report, not a
+floor reconstructed from PTR trades alone. Both chambers: the Senate half
+comes from scrape_senate_annual.py (Phase 18), the House half from
+scrape_house_annual.py (Phase 19), and whoever has been scraped shows up.
 
-    py networth.py --annual                  # every senator with a scraped Annual Report
+    py networth.py --annual                  # every member with a scraped Annual Report
     py networth.py --annual --member Britt   # one senator's asset/liability breakdown
     py networth.py --annual --limit 20       # bounded run, price 20 tickers only
 
@@ -287,30 +287,35 @@ def _midpoint(low, high):
     return low if pd.isna(high) else (low + high) / 2
 
 
-def latest_senate_annual_reports(con):
-    """One report_id per senator -- whichever was filed most recently.
+def latest_annual_reports(con):
+    """One report_id per member -- whichever was filed most recently.
     A same-year amendment has a later filed_date than the original it
-    amends, so it wins here with no special amendment-vs-original logic."""
+    amends, so it wins here with no special amendment-vs-original logic.
+
+    Keyed on (chamber, last_name), not last_name alone: fd_assets holds both
+    chambers now (Phase 18 Senate, Phase 19 House), and a Representative and
+    a Senator sharing a surname would otherwise collapse into one member."""
     reports = con.execute("""
-        SELECT DISTINCT report_id, last_name, first_name, filing_label, filing_year, filed_date
+        SELECT DISTINCT report_id, chamber, last_name, first_name,
+                        filing_label, filing_year, filed_date
         FROM fd_assets
     """).fetchdf()
     if reports.empty:
         return reports
     reports["_filed"] = pd.to_datetime(reports["filed_date"], format="%m/%d/%Y")
     return (reports.sort_values("_filed")
-                    .groupby("last_name", as_index=False).tail(1)
+                    .groupby(["chamber", "last_name"], as_index=False).tail(1)
                     .drop(columns="_filed"))
 
 
 def annual_main(limit=None, member=None):
     con = duckdb.connect(DB_PATH, read_only=True)
-    reports = latest_senate_annual_reports(con)
+    reports = latest_annual_reports(con)
     if member:
         reports = reports[reports["last_name"].str.contains(member, case=False)]
     if reports.empty:
         print("no Annual Financial Disclosure Report on file" + (f" for {member!r}" if member else "")
-              + " -- run scrape_senate_annual.py first")
+              + " -- run scrape_senate_annual.py / scrape_house_annual.py first")
         return
 
     ids = list(reports["report_id"])
@@ -331,8 +336,9 @@ def annual_main(limit=None, member=None):
     rows, line_rows, undetermined = [], [], 0
     for report_id, group in assets.groupby("report_id"):
         last_name, first_name = group["last_name"].iloc[0], group["first_name"].iloc[0]
+        chamber = group["chamber"].iloc[0]
         basis_date = datetime.date(int(year_by_report[report_id]), 12, 31)
-        party = party_lookup.get(("S", normalize_last_name(last_name)), "Unknown")
+        party = party_lookup.get((chamber, normalize_last_name(last_name)), "Unknown")
         total_assets = 0
         for _, a in group.iterrows():
             mid = _midpoint(a["value_low"], a["value_high"])
@@ -350,7 +356,8 @@ def annual_main(limit=None, member=None):
                                    "owner": a["owner"], "value_raw": a["value_raw"], "value": round(mid)})
         liab_rows = liabilities[liabilities["report_id"] == report_id]
         total_liab = sum(_midpoint(l["value_low"], l["value_high"]) or 0 for _, l in liab_rows.iterrows())
-        rows.append({"last_name": last_name, "first_name": first_name, "party": party,
+        rows.append({"chamber": chamber, "last_name": last_name,
+                      "first_name": first_name, "party": party,
                       "filing_label": group["filing_label"].iloc[0],
                       "total_assets": round(total_assets), "total_liabilities": round(total_liab),
                       "net_worth": round(total_assets - total_liab)})
@@ -365,14 +372,14 @@ def annual_main(limit=None, member=None):
         line_df["value"] = line_df["value"].map(money)
         print(line_df.to_string(index=False))
         row = df.iloc[0]
-        print(f"\n{row.last_name} ({row.party}), {row.filing_label}:"
+        print(f"\n{row.last_name} ({row.chamber}-{row.party}), {row.filing_label}:"
               f" assets {money(row.total_assets)} - liabilities {money(row.total_liabilities)}"
               f" = net worth {money(row.net_worth)}")
     else:
         printable = df.assign(total_assets=df["total_assets"].map(money),
                                total_liabilities=df["total_liabilities"].map(money),
                                net_worth=df["net_worth"].map(money))
-        print(printable[["last_name", "party", "filing_label", "total_assets",
+        print(printable[["chamber", "last_name", "party", "filing_label", "total_assets",
                           "total_liabilities", "net_worth"]].to_string(index=False))
 
 
