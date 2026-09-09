@@ -6,9 +6,9 @@
 ![FastAPI](https://img.shields.io/badge/api-FastAPI-009688.svg)
 ![Data](https://img.shields.io/badge/data-public%20domain-brightgreen.svg)
 
-**A self-hosted, open-source alternative to Quiver Quantitative.** Congressional stock trading disclosures plus 16 adjacent public-data feeds (lobbying, insider trades, 13F holdings, short volume, patents, campaign donations, executive pay, net worth, corporate jet movements, and more), scraped from primary government sources, normalized into a single [DuckDB](https://duckdb.org/) file, and served over a read-only REST API.
+**A self-hosted, open-source alternative to Quiver Quantitative.** Congressional stock trading disclosures plus 17 adjacent public-data feeds (lobbying, insider trades, 13F holdings, short volume, patents, campaign donations, executive pay, net worth, corporate jet movements, retail forum attention, and more), scraped from primary government sources, normalized into a single [DuckDB](https://duckdb.org/) file, and served over a read-only REST API.
 
-Every dataset here is public U.S. government or public-domain disclosure data: SEC, Senate/House ethics offices, FEC, FINRA, USAspending, USPTO, Wikimedia, FAA. Nothing is scraped from a paid source. One feed — OpenSky flight history, Phase 20 — is free but account-gated; it is the only non-government dependency in the project, and the only one that will not run anonymously.
+Every dataset here is public U.S. government or public-domain disclosure data: SEC, Senate/House ethics offices, FEC, FINRA, USAspending, USPTO, Wikimedia, FAA. Nothing is scraped from a paid source. Two feeds are free but account-gated — OpenSky flight history (Phase 20) and Reddit (Phase 21) — and they are the only non-government dependencies in the project, and the only ones that will not run anonymously.
 
 ```
 py q.py "SELECT tkr, count(*) AS n, sum(amount_low) AS min_dollars
@@ -44,7 +44,7 @@ The project was scoped originally against congressional trades (Senate + House P
 
 ## Datasets
 
-18 build phases, each independently runnable. ✅ = built and verified against live data.
+21 build phases, each independently runnable. ✅ = built and verified against live data.
 
 | # | Dataset | Source | Auth | Cadence | Module |
 |---|---|---|---|---|---|
@@ -68,6 +68,7 @@ The project was scoped originally against congressional trades (Senate + House P
 | 18 | Senate Annual Financial Disclosure (accurate net worth) | efdsearch.senate.gov | session only | annual | `scrape_senate_annual.py` |
 | 19 | House Annual Financial Disclosure (accurate net worth) | disclosures-clerk.house.gov | none (UA header) | annual | `scrape_house_annual.py` |
 | 20 | Corporate jet registry + flight history | [FAA Releasable Aircraft DB](https://www.faa.gov/licenses_certificates/aircraft_certification/aircraft_registry/releasable_aircraft_download) + [OpenSky](https://opensky-network.org/) | none / OAuth2 client | monthly / daily | `scrape_flights.py` |
+| 21 | r/wallstreetbets mentions + sentiment | [Reddit API](https://www.reddit.com/dev/api/) + [FinBERT](https://huggingface.co/ProsusAI/finbert) | OAuth2 client | daily | `scrape_wsb.py` |
 
 Every scraper is independently runnable, resumable (safe to `Ctrl-C` and re-run), and ships with a `--selftest` flag that validates its parsing logic offline against captured sample data — no network call required.
 
@@ -124,6 +125,7 @@ Quantgress/
 ├── scrape_senate_annual.py    # Phase 18 — Senate Annual Financial Disclosure
 ├── scrape_house_annual.py     # Phase 19 — House Annual Financial Disclosure
 ├── scrape_flights.py          # Phase 20 — FAA aircraft registry + OpenSky flights
+├── scrape_wsb.py              # Phase 21 — r/wallstreetbets mentions + FinBERT sentiment
 ├── q.py                       # query helper (sidesteps PowerShell quoting issues)
 ├── congress_trades.duckdb     # the database (gitignored in a production checkout)
 ├── requirements.txt
@@ -145,18 +147,24 @@ cd Quantgress
 py -m pip install -r requirements.txt
 ```
 
-### API keys (optional, only needed for Phases 12, 13 & 20)
+### API keys (optional, only needed for Phases 12, 13, 20 & 21)
 
-Every other dataset needs no key — either a fully open endpoint or a descriptive `User-Agent`. Patents (USPTO), corporate donations (OpenFEC), and the flight-history half of Phase 20 (OpenSky) each need free credentials. Create a `.env` file in the project root:
+Every other dataset needs no key — either a fully open endpoint or a descriptive `User-Agent`. Patents (USPTO), corporate donations (OpenFEC), the flight-history half of Phase 20 (OpenSky), and Reddit (Phase 21) each need free credentials. Create a `.env` file in the project root:
 
 ```
 USPTO_API_KEY=<from data.uspto.gov, requires ID.me verification>
 FEC_API_KEY=<from api.data.gov/signup, instant>
 OPENSKY_CLIENT_ID=<from opensky-network.org/my-opensky, instant>
 OPENSKY_CLIENT_SECRET=<same page>
+REDDIT_CLIENT_ID=<from reddit.com/prefs/apps, app type "script" — see the approval note below>
+REDDIT_CLIENT_SECRET=<same page>
 ```
 
-All three scrapers still run `--selftest` with no key or network access at all. Phase 20's registry half (`--registry`) needs no credentials either — only `--flights` does, and OpenSky rejects anonymous requests to it outright with a 403.
+**Reddit credentials are not self-service any more.** Under Reddit's [Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy), "you must request access and get explicit approval before accessing any Reddit data through our API." Unlike the USPTO/FEC/OpenSky keys above — all instant — Phase 21 needs a request that a human at Reddit approves, with no committed turnaround. Everything else in this project runs without asking anyone's permission; this one phase does not. `--selftest` and `--no-sentiment` still work regardless.
+
+All four scrapers still run `--selftest` with no key, no network, and (for Phase 21) no model download at all. Phase 20's registry half (`--registry`) needs no credentials either — only `--flights` does, and OpenSky rejects anonymous requests to it outright with a 403. Reddit is the same story: unauthenticated automated reads of `reddit.com/*.json` are blocked, so Phase 21 has no anonymous fallback.
+
+Phase 21's sentiment half also needs `transformers` + `torch` (~2GB installed) for FinBERT, which downloads ~440MB of weights on first run. Both are imported lazily — `py scrape_wsb.py --no-sentiment` collects mention counts without either installed.
 
 ## Quick Start
 
@@ -203,7 +211,7 @@ py -m uvicorn api:app --host 0.0.0.0 --port 8000   # LAN-visible, trusted networ
 | `GET /trades` | The unified congress-trades view. Filters: `tkr`, `last_name`, `chamber` |
 | `GET /politician/{name}` | Per-politician summary + trade listing (substring match on last name) |
 | `GET /ticker/{symbol}` | All activity for one ticker (exact, case-insensitive) |
-| `GET /lobbying` `/contracts` `/insiders` `/13f-positions` `/13f-changes` `/13f-top-holders` `/short-volume` `/patents` `/donors` `/pageviews` `/exec-comp` `/trump-trades` `/senate-assets` `/senate-liabilities` | Generic filtered listing per dataset. `/senate-assets` and `/senate-liabilities` carry both chambers since Phase 19 — filter with `chamber=S` / `chamber=H`. See `RELATIONS` in `api.py` for exact filter columns |
+| `GET /lobbying` `/contracts` `/insiders` `/13f-positions` `/13f-changes` `/13f-top-holders` `/short-volume` `/patents` `/donors` `/pageviews` `/exec-comp` `/trump-trades` `/senate-assets` `/senate-liabilities` `/aircraft` `/corp-flights` `/wsb-mentions` | Generic filtered listing per dataset. `/senate-assets` and `/senate-liabilities` carry both chambers since Phase 19 — filter with `chamber=S` / `chamber=H`. See `RELATIONS` in `api.py` for exact filter columns |
 
 Every listing route accepts `?limit=` (default 100, max 1000) and `?offset=`. Filter columns use one of three match modes chosen per column: exact (codes/IDs/years), case-insensitive exact (tickers), or case-insensitive substring (names). Not a uniform strategy: exact-matching a name column or substring-matching a ticker column both produce wrong results. Interactive docs are auto-generated by FastAPI at `/docs`.
 
@@ -224,7 +232,9 @@ Query the **`trades`** view, not the raw `senate_trades` / `house_trades` tables
 
 **`amount_low` / `amount_high` are a disclosure bracket, not a price.** The STOCK Act only requires a dollar range, never an exact figure. `sum(amount_low)` is a floor, never a total.
 
-Every non-congress dataset (lobbying, contracts, insider trades, 13F, short volume, patents, donors, pageviews, exec comp, Trump trades, annual disclosures) gets its own standalone table — none of them share `trades`' chamber/ticker shape, so they're not unioned into it.
+Every non-congress dataset (lobbying, contracts, insider trades, 13F, short volume, patents, donors, pageviews, exec comp, Trump trades, annual disclosures, aircraft/flights, WSB mentions) gets its own standalone table — none of them share `trades`' chamber/ticker shape, so they're not unioned into it.
+
+**Two of those tables are attention data, not disclosure data:** `pageviews` (Phase 14) and `wsb_mentions` (Phase 21). Nobody filed them, they record what people looked at or talked about, and neither is wired into `networth.py` or any other derived signal — deliberately. This project's own testing of `wsb_mentions`-shaped data found no edge in it (see [Known Limitations](#known-limitations)). Query them as research datasets, not as strategies.
 
 ## Scheduling
 
@@ -244,7 +254,7 @@ schtasks /create /tn "Quantgress Daily" /sc daily /st 09:00 ^
 
 STOCK Act disclosures have a 30–45 day filing window, so a daily cadence is comfortably fast enough; a missed day is invisible and self-heals on the next run.
 
-**Beyond `daily.py`:** only Phases 1-3 run on the schedule above. The other 12 phases (lobbying, contracts, insider trades, 13F, short volume, patents, donors, pageviews, exec comp, Trump trades, annual disclosures) are manual-only today (`py scrape_*.py`) — a real gap once any of that data is served publicly, since a paid tier can't silently go stale. `deploy/cron.d/` has the Linux deployment schedule for the Oracle Cloud box: one `/etc/cron.d` file per cadence group (daily/weekly/quarterly/annual, grouped by each source's actual upstream update frequency, not run nightly regardless) — see [`deploy/cron.d/README.md`](deploy/cron.d/README.md) for the install steps and the full phase-to-cadence mapping. Trump trades (Phase 17) is the one deliberate exception, left manual since ProPublica's mirror has no fixed publication schedule to key a cron line off of.
+**Beyond `daily.py`:** only Phases 1-3 run on the schedule above. The other 13 phases (lobbying, contracts, insider trades, 13F, short volume, patents, donors, pageviews, exec comp, Trump trades, annual disclosures, aircraft/flights, WSB mentions) are manual-only today (`py scrape_*.py`) — a real gap once any of that data is served publicly, since a paid tier can't silently go stale. `deploy/cron.d/` has the Linux deployment schedule for the Oracle Cloud box: one `/etc/cron.d` file per cadence group (daily/weekly/quarterly/annual, grouped by each source's actual upstream update frequency, not run nightly regardless) — see [`deploy/cron.d/README.md`](deploy/cron.d/README.md) for the install steps and the full phase-to-cadence mapping. Trump trades (Phase 17) is the one deliberate exception, left manual since ProPublica's mirror has no fixed publication schedule to key a cron line off of.
 
 ## Legal & Compliance
 
@@ -253,6 +263,7 @@ Every dataset scraped here is public government or public-domain disclosure data
 - **Corporate/PAC donations (`corporate_donations`)** — 52 U.S.C. § 30111(a)(4) bars commercial use or solicitation of individual FEC contributor data. `api.py` only ever serves `corporate_donations_agg`, a pre-aggregated view with `contributor_name` and `sub_id` stripped out entirely — no individual donor is identifiable through the API.
 - **Off-exchange short volume (`short_volume`)** — FINRA's site-wide Terms of Use bar bulk scraping and commercial redistribution; its own API terms bar building a competing product with the data. Currently unresolved whether the daily short-volume catalog's "public dissemination" framing carries a looser license. **Treat this dataset as personal/research use only until confirmed otherwise directly with FINRA.**
 - **Corporate jet flights (`flights`)** — the FAA registry half is public domain like everything else, but OpenSky is a volunteer-fed community network, not a government source, and its data is free for **non-commercial and research use only**. `api.py` exposes the `corp_flights` view rather than the raw `flights` table, so a response always carries the owner a movement is attributable to instead of being a redistributable dump of OpenSky's feed. If the paid API tiers ever ship, this route needs the same scrutiny the FINRA and FEC ones got.
+- **WSB mentions (`wsb_mentions`)** — the most restricted source in the project, and the only one whose *access* is gated on someone's approval rather than just its use. Reddit's [Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy) requires prior approval for any API access at all, and separately bars selling, licensing, sharing, or otherwise commercializing Reddit data without express written approval — explicitly including non-commercial scraping and any use for AI/ML training. Phase 21 is built to sit inside that: no post text, titles, usernames, or post ids are stored in any served table, only a daily per-ticker count and a mean sentiment score, and FinBERT scores locally so nothing is sent anywhere or used to train anything. **The unresolved part is `/wsb-mentions` itself.** Whether serving a derived per-ticker aggregate counts as "sharing Reddit data" is the same open question `short_volume` has with FINRA, and it has not been answered — the difference is that `short_volume`'s public route was cut and this one, per its build spec, was not. Treat `/wsb-mentions` as local/personal like the rest of the API as shipped, and settle this with Reddit before it is ever served publicly or monetized.
 - Every other dataset (SEC EDGAR, USAspending, USPTO, LDA.gov, FAA, Senate/House disclosures, Wikimedia) is unrestricted public-domain U.S. government data.
 
 None of the above blocks personal use, local research, or the API as shipped (unauthenticated, `127.0.0.1`-only). It matters only if this is ever exposed publicly or monetized.
@@ -264,11 +275,12 @@ None of the above blocks personal use, local research, or the API as shipped (un
 - **Entity resolution coverage is genuinely low for four datasets** (lobbying, contracts, patents, donors) — 2–7% of distinct names match a public ticker on the first pass, by design: most lobbying clients, contract recipients, patent assignees, and donors are private companies, government bodies, or associations with no ticker to have.
 - **No `con.close()` in every scraper** (in progress). A completed run's data can sit WAL-only until the connection is cleanly closed. Don't delete a `.duckdb.wal` file without checking whether it holds unflushed data first.
 - **Corporate jet ownership is deliberately obscured, and the registry is the weaker half of Phase 20.** Of 24,662 company-registered jets, the single largest registrant is `BANK OF UTAH TRUSTEE` (1,293 airframes), followed by two more ownership-anonymizing trusts — a jet held through a trust or a shell LLC has no public link back to the operating company, so `entities.py` resolves only ~4,900 airframes across 108 names to a ticker. Separately, [Section 803 of the FAA Reauthorization Act of 2024](https://www.faa.gov/licenses_certificates/aircraft_certification/aircraft_registry/withhold_ownership_data) lets owners request their details be withheld; it covers the PII of **individual** owners, which Phase 20's corporate-registrant filter already excludes, so it should not erode this table directly — but watch it.
+- **WSB mentions are an attention dataset with a known-negative track record, and the noisiest table here.** Three separate problems, none fully solved: (1) tickers come from a regex over post text, so an all-caps English word that is also a listed symbol reads as a mention — the stoplist in `scrape_wsb.py` catches the known offenders (`TECH`, `BULL`, `MEME`, `IT`, `AI`, `EV`), at the cost of dropping genuine mentions of those symbols entirely; (2) FinBERT scores a whole post, not a mention, so a post that is bullish on one ticker and bearish on another counts bullish for both; (3) FinBERT is trained on Reuters newswire and the Financial PhraseBank, not forum slang or sarcasm, and benchmarks at 69% on hand-labeled 3-class WSB text. Above all: a full-year 2025 backtest of trading on exactly this signal returned **-49%** once a look-ahead bug was fixed. It is logged because it is interesting, not because it works.
 - **Trump 278-T data is OCR'd from scanned forms**, not born-digital text. Query `trump_trades_clean`, not the raw `trump_trades` table, unless specifically auditing the parse. The clean view filters out rows with detectable OCR corruption.
 
 ## Roadmap
 
-Not currently planned: WSB/Reddit sentiment, Twitter/X data (API now paid). Corporate jet flight tracking shipped as Phase 20 — the "FAA coverage shrinking" objection that had it shelved turned out to be aimed at the wrong half: Section 803 withholding applies to individual owners, not the corporate registrants this phase filters for. The real coverage ceiling is trust/LLC ownership opacity, which predates it (see Known Limitations). Full phase-by-phase implementation notes, live-run numbers, and every gotcha found along the way live in the project wiki.
+Not currently planned: Twitter/X data (API now paid). WSB/Reddit sentiment shipped as Phase 21 — as a research dataset, not a signal: it is queryable alongside everything else and is wired into nothing, because the strategy built on it lost half its money in backtest (see Known Limitations). Corporate jet flight tracking shipped as Phase 20 — the "FAA coverage shrinking" objection that had it shelved turned out to be aimed at the wrong half: Section 803 withholding applies to individual owners, not the corporate registrants this phase filters for. The real coverage ceiling is trust/LLC ownership opacity, which predates it (see Known Limitations). Full phase-by-phase implementation notes, live-run numbers, and every gotcha found along the way live in the project wiki.
 
 ## License
 
