@@ -16,6 +16,7 @@ cron silently ignores any `/etc/cron.d` file with group/other write permission �
 | `quantgress-weekly` | 7 (`scrape_contracts.py`), 12 (`scrape_patents.py`) | weekly, Sunday |
 | `quantgress-quarterly` | 10 (`scrape_13f.py`), 6 (`scrape_lobbying.py`) | quarterly (Jan/Apr/Jul/Oct 1st) |
 | `quantgress-annual` | 13 (`scrape_donors.py`), 16 (`scrape_execcomp.py`), 18 (`scrape_senate_annual.py`) | annual (Jan 2nd) |
+| `quantgress-annual` | 19 (`scrape_house_annual.py`) | annual (Sep 2nd — after the August filing-extension deadline) |
 
 **Phase 17 (`scrape_trump.py`) has no cron file, deliberately.** ProPublica's DocumentCloud mirror for Trump's OGE 278-T filings has no fixed publication schedule — there's no real cadence to key a cron line off of. Run it manually (`py scrape_trump.py`) until a pattern in update frequency emerges.
 

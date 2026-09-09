@@ -6,3 +6,7 @@
      0    9    2    1    *   ubuntu   cd /home/ubuntu/quantgress && venv/bin/python scrape_donors.py >> logs/donors.log 2>&1
     15    9    2    1    *   ubuntu   cd /home/ubuntu/quantgress && venv/bin/python scrape_execcomp.py >> logs/execcomp.log 2>&1
     30    9    2    1    *   ubuntu   cd /home/ubuntu/quantgress && venv/bin/python scrape_senate_annual.py >> logs/senate_annual.log 2>&1
+# House annual reports are due May 15 with extensions to mid-August, so the
+# prior year's coverage is only complete in September -- a January run would
+# find an empty index for it.
+    45    9    2    9    *   ubuntu   cd /home/ubuntu/quantgress && venv/bin/python scrape_house_annual.py >> logs/house_annual.log 2>&1
