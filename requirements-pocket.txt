@@ -1,0 +1,4 @@
+# Deliberately narrow V1 dependency set. Reddit, ML, API, and unrelated feeds
+# are excluded from the Pocket public-evidence pilot.
+duckdb==1.5.6
+requests==2.34.2

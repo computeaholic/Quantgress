@@ -1,0 +1,39 @@
+{
+  "results": [
+    {
+      "generated_internal_id": "CONT_AWD_FAKE123_9700_-NONE-_-NONE-",
+      "Award ID": "FAKE123",
+      "Mod": "0",
+      "Action Date": "2026-08-01",
+      "Action Type": "A",
+      "Award Type": "DEFINITIVE CONTRACT",
+      "Recipient Name": "ACME DEFENSE SUBSIDIARY LLC",
+      "Recipient UEI": "ZE6ZM6NKSV43",
+      "recipient_id": "recipient-1-C",
+      "Transaction Amount": "1000000.00",
+      "Transaction Description": "Initial funded obligation",
+      "Awarding Agency": "Department of Defense",
+      "Awarding Sub Agency": "Defense Health Agency",
+      "Funding Agency": "Department of Defense",
+      "Funding Sub Agency": "Defense Health Agency"
+    },
+    {
+      "generated_internal_id": "CONT_AWD_FAKE123_9700_-NONE-_-NONE-",
+      "Award ID": "FAKE123",
+      "Mod": "P00001",
+      "Action Date": "2026-08-12",
+      "Action Type": "C",
+      "Award Type": "DEFINITIVE CONTRACT",
+      "Recipient Name": "ACME DEFENSE SUBSIDIARY LLC",
+      "Recipient UEI": "ZE6ZM6NKSV43",
+      "recipient_id": "recipient-1-C",
+      "Transaction Amount": "250000.00",
+      "Transaction Description": "Incremental funded modification",
+      "Awarding Agency": "Department of Defense",
+      "Awarding Sub Agency": "Defense Health Agency",
+      "Funding Agency": "Department of Defense",
+      "Funding Sub Agency": "Defense Health Agency"
+    }
+  ],
+  "page_metadata": {"page": 1, "hasPrevious": false, "hasNext": false, "previous": null, "next": null}
+}
