@@ -362,13 +362,13 @@ def parse_form4_xml(xml_text, filed_date, accession_number=None, source_url=None
         rel = o.find("reportingOwnerRelationship")
         roles = []
         if rel is not None:
-            if rel.findtext("isDirector") == "1":
+            if _truthy(rel.findtext("isDirector")):
                 roles.append("DIRECTOR")
-            if rel.findtext("isOfficer") == "1":
+            if _truthy(rel.findtext("isOfficer")):
                 roles.append("OFFICER")
-            if rel.findtext("isTenPercentOwner") == "1":
+            if _truthy(rel.findtext("isTenPercentOwner")):
                 roles.append("TENPERCENTOWNER")
-            if rel.findtext("isOther") == "1":
+            if _truthy(rel.findtext("isOther")):
                 roles.append("OTHER")
         if roles:
             rels.append(",".join(roles))

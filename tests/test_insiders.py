@@ -37,6 +37,13 @@ class InsiderClassificationTests(unittest.TestCase):
         self.assertEqual(row["publication_date"], "2026-10-02")
         self.assertEqual(row["first_observed_at"], OBSERVED)
 
+    def test_text_boolean_relationship_flags_are_preserved(self):
+        xml = (FIXTURES / "form4_open_market_purchase.xml").read_text()
+        xml = xml.replace("<isDirector>1</isDirector>",
+                          "<isDirector>true</isDirector>")
+        row = parse_form4_xml(xml, filed_date="2026-10-02")[0]
+        self.assertEqual(row["owner_relationship"], "DIRECTOR")
+
     def test_vesting_and_tax_withholding_are_not_purchases(self):
         rows = self.parse("form4_vesting_withholding.xml")
         self.assertEqual([r["transaction_category"] for r in rows], [
