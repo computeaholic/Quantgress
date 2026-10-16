@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ownershipDocument>
+  <documentType>4</documentType>
+  <periodOfReport>2026-08-11</periodOfReport>
+  <aff10b5One>false</aff10b5One>
+  <issuer>
+    <issuerCik>0000000003</issuerCik>
+    <issuerName>COMPENSATION CORP</issuerName>
+    <issuerTradingSymbol>COMP</issuerTradingSymbol>
+  </issuer>
+  <reportingOwner>
+    <reportingOwnerId>
+      <rptOwnerCik>0000000004</rptOwnerCik>
+      <rptOwnerName>ROE JOHN</rptOwnerName>
+    </reportingOwnerId>
+    <reportingOwnerRelationship>
+      <isDirector>0</isDirector>
+      <isOfficer>1</isOfficer>
+      <isTenPercentOwner>0</isTenPercentOwner>
+      <isOther>0</isOther>
+    </reportingOwnerRelationship>
+  </reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionDate><value>2026-08-11</value></transactionDate>
+      <transactionCoding><transactionCode>A</transactionCode></transactionCoding>
+      <transactionAmounts>
+        <transactionShares><value>100</value></transactionShares>
+        <transactionPricePerShare><value>0</value></transactionPricePerShare>
+        <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>
+      </transactionAmounts>
+      <postTransactionAmounts><sharesOwnedFollowingTransaction><value>1000</value></sharesOwnedFollowingTransaction></postTransactionAmounts>
+      <footnoteId id="F1" />
+    </nonDerivativeTransaction>
+    <nonDerivativeTransaction>
+      <securityTitle><value>Common Stock</value></securityTitle>
+      <transactionDate><value>2026-08-11</value></transactionDate>
+      <transactionCoding><transactionCode>F</transactionCode></transactionCoding>
+      <transactionAmounts>
+        <transactionShares><value>30</value></transactionShares>
+        <transactionPricePerShare><value>42.10</value></transactionPricePerShare>
+        <transactionAcquiredDisposedCode><value>D</value></transactionAcquiredDisposedCode>
+      </transactionAmounts>
+      <postTransactionAmounts><sharesOwnedFollowingTransaction><value>970</value></sharesOwnedFollowingTransaction></postTransactionAmounts>
+      <footnoteId id="F2" />
+    </nonDerivativeTransaction>
+  </nonDerivativeTable>
+  <footnotes>
+    <footnote id="F1">Restricted stock units vested under the issuer compensation plan.</footnote>
+    <footnote id="F2">Shares withheld by the issuer to satisfy tax withholding obligations.</footnote>
+  </footnotes>
+</ownershipDocument>
