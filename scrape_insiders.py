@@ -41,6 +41,7 @@ collapse amendments into the original.
 import csv
 import datetime
 import io
+import os
 import re
 import sys
 import time
@@ -48,10 +49,9 @@ import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter, defaultdict
 
-import duckdb
 import requests
 
-from schema import DB_PATH
+from pocket_store import single_writer
 
 INDEX_URL = "https://www.sec.gov/data-research/sec-markets-data/insider-transactions-data-sets"
 # Path prefix isn't stable across quarters -- older zips sit under
@@ -68,22 +68,51 @@ RATE_LIMIT_SECS = 0.15  # SEC's own guidance caps automated access at 10 req/sec
 DAYS_DEFAULT = 7
 
 TABLE = "insider_trades"
-COLUMNS = ["accession_number", "trans_seq", "filed_date", "trans_date",
+DEFAULT_POCKET_DB = "data/pocket.duckdb"
+COLUMNS = ["accession_number", "trans_seq", "filed_date", "publication_date", "trans_date",
            "issuer_cik", "issuer_name", "ticker",
            "owner_cik", "owner_name", "owner_relationship",
            "security_title", "trans_code", "acquired_disposed",
-           "shares", "price_per_share", "shares_owned_following"]
+           "shares", "price_per_share", "shares_owned_following",
+           "document_type", "is_amendment", "is_10b5_1",
+           "transaction_category", "is_discretionary_purchase",
+           "identification_confidence", "classification_reason",
+           "footnotes", "remarks", "source_url",
+           "publication_date_status", "first_observed_at"]
+
+NEW_COLUMNS = {
+    "publication_date": "DATE",
+    "document_type": "VARCHAR",
+    "is_amendment": "BOOLEAN",
+    "is_10b5_1": "BOOLEAN",
+    "transaction_category": "VARCHAR",
+    "is_discretionary_purchase": "BOOLEAN",
+    "identification_confidence": "VARCHAR",
+    "classification_reason": "VARCHAR",
+    "footnotes": "VARCHAR",
+    "remarks": "VARCHAR",
+    "source_url": "VARCHAR",
+    "publication_date_status": "VARCHAR",
+    "first_observed_at": "TIMESTAMPTZ",
+}
 
 
 def ensure_table(con):
     con.execute(f"""CREATE TABLE IF NOT EXISTS {TABLE} (
         accession_number VARCHAR, trans_seq INTEGER,
-        filed_date VARCHAR, trans_date VARCHAR,
+        filed_date VARCHAR, publication_date DATE, trans_date VARCHAR,
         issuer_cik VARCHAR, issuer_name VARCHAR, ticker VARCHAR,
         owner_cik VARCHAR, owner_name VARCHAR, owner_relationship VARCHAR,
         security_title VARCHAR, trans_code VARCHAR, acquired_disposed VARCHAR,
         shares DOUBLE, price_per_share DOUBLE, shares_owned_following DOUBLE,
+        document_type VARCHAR, is_amendment BOOLEAN, is_10b5_1 BOOLEAN,
+        transaction_category VARCHAR, is_discretionary_purchase BOOLEAN,
+        identification_confidence VARCHAR, classification_reason VARCHAR,
+        footnotes VARCHAR, remarks VARCHAR, source_url VARCHAR,
+        publication_date_status VARCHAR, first_observed_at TIMESTAMPTZ,
         PRIMARY KEY (accession_number, trans_seq))""")
+    for column, column_type in NEW_COLUMNS.items():
+        con.execute(f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {column} {column_type}")
 
 
 def _num(x):
@@ -100,27 +129,102 @@ def _iso_date(s):
         return None
 
 
+def _truthy(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def classify_transaction(trans_code, acquired_disposed, price_per_share,
+                         is_10b5_1=False, footnotes=None):
+    """Classify a Table I transaction without promoting every acquisition.
+
+    SEC code P formally covers open-market *or private* purchases.  An
+    explicit open-market footnote earns high confidence; an otherwise plain,
+    positive-price P acquisition remains medium confidence.  Compensation,
+    withholding, exercises, gifts, and automatic-plan activity are excluded
+    from discretionary-purchase output.
+    """
+
+    code = (trans_code or "").upper()
+    acquired = (acquired_disposed or "").upper()
+    text = (footnotes or "").lower()
+    automatic = is_10b5_1 or "10b5-1" in text or "trading plan" in text
+    if automatic:
+        return ("AUTOMATIC_PLAN_TRANSACTION", False, "HIGH",
+                "filing identifies Rule 10b5-1 or another automatic trading plan")
+    if code == "F":
+        return ("TAX_WITHHOLDING", False, "HIGH",
+                "SEC transaction code F is payment of tax liability by withholding securities")
+    if code == "A":
+        return ("COMPENSATION_OR_VESTING", False, "HIGH",
+                "SEC transaction code A is a grant, award, or other acquisition")
+    if code == "M":
+        return ("OPTION_EXERCISE", False, "HIGH",
+                "SEC transaction code M is exercise or conversion of a derivative security")
+    if code == "G":
+        return ("GIFT", False, "HIGH", "SEC transaction code G is a gift")
+    if code == "P" and acquired == "A":
+        if any(term in text for term in ("private placement", "privately negotiated", "from the issuer")):
+            return ("PRIVATE_OR_NEGOTIATED_PURCHASE", False, "HIGH",
+                    "code P filing text identifies a private or issuer transaction")
+        if "open market" in text:
+            return ("OPEN_MARKET_PURCHASE", True, "HIGH",
+                    "code P acquisition and filing text explicitly says open market")
+        if price_per_share is not None and price_per_share > 0:
+            return ("OPEN_MARKET_PURCHASE", True, "MEDIUM",
+                    "code P acquisition at positive price; SEC code P also permits private purchases")
+        return ("PURCHASE_UNCONFIRMED", False, "LOW",
+                "code P lacks a positive price or explicit open-market evidence")
+    if code == "S":
+        return ("OPEN_MARKET_SALE", False, "MEDIUM",
+                "SEC code S is an open-market or private sale")
+    return ("OTHER_OR_UNRESOLVED", False, "LOW",
+            f"transaction code {code or 'missing'} is not a qualifying discretionary purchase")
+
+
+def filing_url(issuer_cik, accession_number):
+    cik = str(issuer_cik or "").lstrip("0") or "0"
+    accession = str(accession_number or "")
+    compact = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{cik}/{compact}/{accession}-index.html"
+
+
 # ---------------------------------------------------------------- bulk mode
 
-def _read_tsv(zf, name):
+def _iter_tsv(zf, name):
     with zf.open(name) as f:
-        return list(csv.DictReader(io.TextIOWrapper(f, encoding="utf-8", errors="replace"),
-                                    delimiter="\t"))
+        yield from csv.DictReader(
+            io.TextIOWrapper(f, encoding="utf-8", errors="replace"), delimiter="\t"
+        )
 
 
-def read_quarter_zip(content):
+def iter_bulk_quarter(content, observed_at=None):
+    """Yield a quarter without materializing the large transaction TSV.
+
+    SUBMISSION and REPORTINGOWNER are lookup tables and remain bounded in
+    memory. NONDERIV_TRANS is consumed one row at a time while the ZIP is
+    open—the material memory defect in the reviewed revision.
+    """
+
+    observed_at = observed_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        return (_read_tsv(zf, "SUBMISSION.tsv"), _read_tsv(zf, "NONDERIV_TRANS.tsv"),
-                _read_tsv(zf, "REPORTINGOWNER.tsv"))
+        sub_rows = list(_iter_tsv(zf, "SUBMISSION.tsv"))
+        owner_rows = list(_iter_tsv(zf, "REPORTINGOWNER.tsv"))
+        yield from parse_bulk_quarter(
+            sub_rows,
+            _iter_tsv(zf, "NONDERIV_TRANS.tsv"),
+            owner_rows,
+            observed_at=observed_at,
+        )
 
 
-def parse_bulk_quarter(sub_rows, trans_rows, owner_rows):
+def parse_bulk_quarter(sub_rows, trans_rows, owner_rows, observed_at=None):
     """Join SUBMISSION + NONDERIV_TRANS + REPORTINGOWNER on ACCESSION_NUMBER.
 
     Form 4/4A only -- Form 3 (initial position, no transaction) and Form 5
     (annual catch-up) are skipped, same "is this an actual trade" filter as
     the docstring's Table I decision.
     """
+    observed_at = observed_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
     sub_by_acc = {s["ACCESSION_NUMBER"]: s for s in sub_rows
                   if s["DOCUMENT_TYPE"] in ("4", "4/A")}
     owners_by_acc = defaultdict(list)
@@ -136,9 +240,21 @@ def parse_bulk_quarter(sub_rows, trans_rows, owner_rows):
         owners = owners_by_acc.get(acc, [])
         n = seq[acc]
         seq[acc] += 1
+        price = _num(t["TRANS_PRICEPERSHARE"])
+        footnotes = t.get("FOOTNOTE_TEXT") or t.get("TRANS_FOOTNOTE") or None
+        is_10b5_1 = _truthy(sub.get("AFF10B5ONE") or sub.get("AFF_10B5_ONE"))
+        category, discretionary, confidence, reason = classify_transaction(
+            t["TRANS_CODE"] or None,
+            t["TRANS_ACQUIRED_DISP_CD"] or None,
+            price,
+            is_10b5_1=is_10b5_1,
+            footnotes=footnotes,
+        )
+        document_type = sub["DOCUMENT_TYPE"]
         yield {
             "accession_number": acc, "trans_seq": n,
             "filed_date": _iso_date(sub["FILING_DATE"]),
+            "publication_date": _iso_date(sub["FILING_DATE"]),
             "trans_date": _iso_date(t["TRANS_DATE"]),
             "issuer_cik": sub["ISSUERCIK"], "issuer_name": sub["ISSUERNAME"],
             "ticker": sub["ISSUERTRADINGSYMBOL"] or None,
@@ -150,8 +266,20 @@ def parse_bulk_quarter(sub_rows, trans_rows, owner_rows):
             "trans_code": t["TRANS_CODE"] or None,
             "acquired_disposed": t["TRANS_ACQUIRED_DISP_CD"] or None,
             "shares": _num(t["TRANS_SHARES"]),
-            "price_per_share": _num(t["TRANS_PRICEPERSHARE"]),
+            "price_per_share": price,
             "shares_owned_following": _num(t["SHRS_OWND_FOLWNG_TRANS"]),
+            "document_type": document_type,
+            "is_amendment": document_type == "4/A",
+            "is_10b5_1": is_10b5_1,
+            "transaction_category": category,
+            "is_discretionary_purchase": discretionary,
+            "identification_confidence": confidence,
+            "classification_reason": reason,
+            "footnotes": footnotes,
+            "remarks": sub.get("REMARKS") or None,
+            "source_url": filing_url(sub["ISSUERCIK"], acc),
+            "publication_date_status": "REPORTED_FILING_DATE",
+            "first_observed_at": observed_at,
         }
 
 
@@ -168,11 +296,11 @@ def list_quarters(s):
 def list_daily_form4(s, date):
     """Yield full-index paths ('edgar/data/CIK/ACCESSION.txt') for every
     Form 4 / 4-A filed on `date`. A 404 means no index was published that
-    day (weekend/holiday) -- a legitimate answer, not a failure, same as
-    scrape_pageviews.py's 404 handling."""
+    day (weekend/holiday). A 403 must fail closed: it is indistinguishable
+    from SEC blocking this deployment host and cannot establish freshness."""
     url = (f"https://www.sec.gov/Archives/edgar/daily-index/{date.year}/"
            f"QTR{(date.month - 1) // 3 + 1}/form.{date:%Y%m%d}.idx")
-    r = _get(s, url, not_found=(403, 404))
+    r = _get(s, url, not_found=(404,))
     if r is None:
         return
     for line in r.text.splitlines():
@@ -204,10 +332,20 @@ def _tag_value(el, path):
     return v.text.strip() if v is not None and v.text else None
 
 
-def parse_form4_xml(xml_text, filed_date):
+def parse_form4_xml(xml_text, filed_date, accession_number=None, source_url=None,
+                    observed_at=None):
     """One filing's ownershipDocument XML -> list of Table I transaction
     rows (trans_seq 0, 1, 2... in document order)."""
     root = ET.fromstring(xml_text)
+    observed_at = observed_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    document_type = (root.findtext("documentType") or "4").strip()
+    is_10b5_1 = _truthy(root.findtext("aff10b5One"))
+    remarks = (root.findtext("remarks") or "").strip() or None
+    filing_footnotes = {
+        node.attrib.get("id"): " ".join("".join(node.itertext()).split())
+        for node in root.findall("footnotes/footnote")
+        if node.attrib.get("id")
+    }
     issuer = root.find("issuer")
     issuer_cik = issuer_name = ticker = None
     if issuer is not None:
@@ -244,20 +382,48 @@ def parse_form4_xml(xml_text, filed_date):
         return rows
     for i, tx in enumerate(table.findall("nonDerivativeTransaction")):
         code_el = tx.find("transactionCoding/transactionCode")
+        trans_code = code_el.text.strip() if code_el is not None and code_el.text else None
+        acquired_disposed = _tag_value(tx, "transactionAmounts/transactionAcquiredDisposedCode")
+        price = _num(_tag_value(tx, "transactionAmounts/transactionPricePerShare"))
+        ids = [node.attrib.get("id") for node in tx.findall(".//footnoteId")]
+        footnotes = " ".join(filing_footnotes[item] for item in ids
+                             if item in filing_footnotes) or None
+        category, discretionary, confidence, reason = classify_transaction(
+            trans_code,
+            acquired_disposed,
+            price,
+            is_10b5_1=is_10b5_1,
+            footnotes=" ".join(filter(None, (footnotes, remarks))),
+        )
         rows.append({
             "trans_seq": i, "filed_date": filed_date,
+            "publication_date": filed_date,
             "trans_date": _tag_value(tx, "transactionDate"),
             "issuer_cik": issuer_cik, "issuer_name": issuer_name, "ticker": ticker,
             "owner_cik": owner_cik, "owner_name": owner_name,
             "owner_relationship": owner_relationship,
             "security_title": _tag_value(tx, "securityTitle"),
-            "trans_code": code_el.text.strip() if code_el is not None and code_el.text else None,
-            "acquired_disposed": _tag_value(tx, "transactionAmounts/transactionAcquiredDisposedCode"),
+            "trans_code": trans_code,
+            "acquired_disposed": acquired_disposed,
             "shares": _num(_tag_value(tx, "transactionAmounts/transactionShares")),
-            "price_per_share": _num(_tag_value(tx, "transactionAmounts/transactionPricePerShare")),
+            "price_per_share": price,
             "shares_owned_following": _num(
                 _tag_value(tx, "postTransactionAmounts/sharesOwnedFollowingTransaction")),
+            "document_type": document_type,
+            "is_amendment": document_type == "4/A",
+            "is_10b5_1": is_10b5_1,
+            "transaction_category": category,
+            "is_discretionary_purchase": discretionary,
+            "identification_confidence": confidence,
+            "classification_reason": reason,
+            "footnotes": footnotes,
+            "remarks": remarks,
+            "source_url": source_url,
+            "publication_date_status": "REPORTED_FILING_DATE",
+            "first_observed_at": observed_at,
         })
+        if accession_number is not None:
+            rows[-1]["accession_number"] = accession_number
     return rows
 
 
@@ -265,7 +431,10 @@ def parse_form4_xml(xml_text, filed_date):
 
 def _session():
     s = requests.Session()
-    s.headers["User-Agent"] = "quantgress/0.1 (mmulajkar@gmail.com)"  # sec.gov 403s without a contact email
+    s.headers["User-Agent"] = os.environ.get(
+        "QUANTGRESS_SEC_USER_AGENT",
+        "quantgress-pocket/0.1 (computeaholic@users.noreply.github.com)",
+    )
     return s
 
 
@@ -274,9 +443,9 @@ def _get(s, url, tries=4, not_found=(404,)):
     legitimate answer here too (no daily index on a non-trading day), so it
     short-circuits without burning a retry, same as scrape_pageviews.py.
 
-    `not_found` widens that set for one call site: today's not-yet-published
-    daily index 403s rather than 404ing (confirmed live -- S3-style "access
-    denied" for a key that doesn't exist yet, not a real auth failure)."""
+    Callers may widen `not_found` only when another status is independently
+    known to mean absence. The Form 4 collector does not swallow 403 because
+    doing so can turn source blocking into a false zero-filing result."""
     for attempt in range(tries):
         try:
             r = s.get(url, timeout=30)
@@ -289,6 +458,8 @@ def _get(s, url, tries=4, not_found=(404,)):
             return r
         if r.status_code in not_found:
             return None
+        if r.status_code in (401, 403):
+            r.raise_for_status()
         if attempt == tries - 1:
             r.raise_for_status()
         time.sleep(5 * (attempt + 1))
@@ -318,12 +489,7 @@ def _insert_rows(con, done, rows):
     return added, skipped
 
 
-def main_bulk(quarter=None, limit=None):
-    con = duckdb.connect(DB_PATH)
-    ensure_table(con)
-    done = {(r[0], r[1]) for r in con.execute(
-        f"SELECT accession_number, trans_seq FROM {TABLE}").fetchall()}
-
+def main_bulk(quarter=None, limit=None, db_path=DEFAULT_POCKET_DB):
     s = _session()
     quarters = list_quarters(s)
     if not quarters:
@@ -335,68 +501,72 @@ def main_bulk(quarter=None, limit=None):
 
     print(f"{quarter}: downloading {url}")
     r = _get(s, url)
-    sub, trans, owner = read_quarter_zip(r.content)
-    print(f"  {len(sub)} submissions, {len(trans)} Table I transactions, {len(owner)} owner rows")
+    if r is None:
+        sys.exit(f"could not download {url}")
 
+    observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     added = skipped = 0
-    insert_sql = f"INSERT INTO {TABLE} ({','.join(COLUMNS)}) VALUES ({','.join('?' * len(COLUMNS))})"
-    for row in parse_bulk_quarter(sub, trans, owner):
-        if limit is not None and added >= limit:
-            break
-        key = (row["accession_number"], row["trans_seq"])
-        if key in done:
-            skipped += 1
-            continue
-        con.execute(insert_sql, [row[c] for c in COLUMNS])
-        done.add(key)
-        added += 1
-        if added % 2000 == 0:
-            print(f"  ...{added} added so far")
+    with single_writer(db_path) as con:
+        ensure_table(con)
+        done = {(row[0], row[1]) for row in con.execute(
+            f"SELECT accession_number, trans_seq FROM {TABLE}").fetchall()}
+        for row in iter_bulk_quarter(r.content, observed_at=observed_at):
+            if limit is not None and added >= limit:
+                break
+            new_rows, duplicate_count = _insert_rows(con, done, [row])
+            added += len(new_rows)
+            skipped += duplicate_count
+            if added and added % 2000 == 0:
+                print(f"  ...{added} added so far")
+        total = con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0]
 
-    total = con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0]
-    print(f"\n{total} insider transactions in {DB_PATH}; this run added {added},"
+    print(f"\n{total} insider transactions in {db_path}; this run added {added},"
           f" skipped {skipped} already-stored")
 
 
-def main_live(days=DAYS_DEFAULT, limit=None):
-    con = duckdb.connect(DB_PATH)
-    ensure_table(con)
-    done = {(r[0], r[1]) for r in con.execute(
-        f"SELECT accession_number, trans_seq FROM {TABLE}").fetchall()}
-
+def main_live(days=DAYS_DEFAULT, limit=None, db_path=DEFAULT_POCKET_DB):
     s = _session()
     added = skipped = 0
     today = datetime.date.today()
-    for delta in range(days):
-        if limit is not None and added >= limit:
-            break
-        date = today - datetime.timedelta(days=delta)
-        filings = list(list_daily_form4(s, date))
-        print(f"{date}: {len(filings)} Form 4 filings")
-        for path in filings:
+    observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    with single_writer(db_path) as con:
+        ensure_table(con)
+        done = {(row[0], row[1]) for row in con.execute(
+            f"SELECT accession_number, trans_seq FROM {TABLE}").fetchall()}
+        for delta in range(days):
             if limit is not None and added >= limit:
                 break
-            time.sleep(RATE_LIMIT_SECS)
-            txt = fetch_filing(s, path)
-            if not txt:
-                continue
-            xml = extract_xml(txt)
-            if not xml:
-                continue
-            acc = accession_from_path(path)
-            rows = parse_form4_xml(xml, date.isoformat())
-            for row in rows:
-                row["accession_number"] = acc
-            new_rows, sk = _insert_rows(con, done, rows)
-            added += len(new_rows)
-            skipped += sk
-            for row in new_rows:
-                print(f"  {row['ticker'] or row['issuer_name']:<8} {row['trans_code']} "
-                      f"{row['acquired_disposed']} {row['shares']} @ {row['price_per_share']}"
-                      f"  {row['owner_name']}")
+            date = today - datetime.timedelta(days=delta)
+            filings = list(list_daily_form4(s, date))
+            print(f"{date}: {len(filings)} Form 4 filings")
+            for path in filings:
+                if limit is not None and added >= limit:
+                    break
+                time.sleep(RATE_LIMIT_SECS)
+                txt = fetch_filing(s, path)
+                if not txt:
+                    continue
+                xml = extract_xml(txt)
+                if not xml:
+                    continue
+                acc = accession_from_path(path)
+                rows = parse_form4_xml(
+                    xml,
+                    date.isoformat(),
+                    accession_number=acc,
+                    source_url="https://www.sec.gov/Archives/" + path,
+                    observed_at=observed_at,
+                )
+                new_rows, duplicate_count = _insert_rows(con, done, rows)
+                added += len(new_rows)
+                skipped += duplicate_count
+                for row in new_rows:
+                    print(f"  {row['ticker'] or row['issuer_name']:<8} {row['trans_code']} "
+                          f"{row['acquired_disposed']} {row['shares']} @ {row['price_per_share']}"
+                          f"  {row['owner_name']}")
 
-    total = con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0]
-    print(f"\n{total} insider transactions in {DB_PATH}; this run added {added},"
+        total = con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0]
+    print(f"\n{total} insider transactions in {db_path}; this run added {added},"
           f" skipped {skipped} already-stored")
 
 
@@ -540,8 +710,9 @@ def selftest():
     finally:
         time.sleep = real_sleep
 
-    # today's not-yet-published index 403s instead of 404ing -- confirmed
-    # live -- and list_daily_form4 must treat that as "no data" too
+    # A 403 cannot prove that an index is absent; it may mean SEC has blocked
+    # the deployment host. The collector must fail closed rather than report
+    # a false zero-filing day.
     def _raise(self):
         raise requests.exceptions.HTTPError("403")
 
@@ -550,19 +721,11 @@ def selftest():
             return type("R", (), {"status_code": 403, "raise_for_status": _raise})()
 
     try:
-        assert list(list_daily_form4(_Forbidden(), datetime.date(2026, 8, 14))) == []
-    finally:
-        time.sleep = real_sleep
-
-    # but a plain _get call (not the daily-index path) must still treat a
-    # 403 as a real error, not silently swallow it -- widening not_found is
-    # opt-in per call site, not a global change to auth-failure behavior
-    try:
-        _get(_Forbidden(), "http://example.invalid", tries=1)
+        list(list_daily_form4(_Forbidden(), datetime.date(2026, 8, 14)))
     except requests.exceptions.HTTPError:
         pass
     else:
-        raise AssertionError("plain _get must not swallow a 403")
+        raise AssertionError("daily Form 4 lookup must not swallow a 403")
     finally:
         time.sleep = real_sleep
 
@@ -596,7 +759,8 @@ if __name__ == "__main__":
     else:
         n = arg("--limit")
         lim = int(n) if n else None
+        db_path = arg("--db", DEFAULT_POCKET_DB)
         if "--live" in sys.argv:
-            main_live(int(arg("--days", DAYS_DEFAULT)), lim)
+            main_live(int(arg("--days", DAYS_DEFAULT)), lim, db_path=db_path)
         else:
-            main_bulk(arg("--quarter"), lim)
+            main_bulk(arg("--quarter"), lim, db_path=db_path)

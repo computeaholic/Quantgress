@@ -10,6 +10,31 @@
 
 Every dataset here is public U.S. government or public-domain disclosure data: SEC, Senate/House ethics offices, FEC, FINRA, USAspending, USPTO, Wikimedia, FAA. Nothing is scraped from a paid source. Two feeds are free but account-gated — OpenSky flight history (Phase 20) and Reddit (Phase 21) — and they are the only non-government dependencies in the project, and the only ones that will not run anonymously.
 
+## Pocket public-evidence pilot
+
+This branch contains a deliberately narrow local adapter for The Pocket. It
+qualifies only SEC Form 4 and USAspending contract actions as discovery inputs;
+it does not run the REST API, Reddit/ML stack, unrelated collectors, a scheduler,
+or any trading/decision process. See [the reproducible pilot guide](docs/pocket-pilot.md),
+[source coverage and freshness](docs/source-coverage-freshness.md), and
+[defect resolution](docs/defect-resolution.md).
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements-pocket.txt
+.venv/bin/python pocket.py selftest
+
+# Manual, bounded collection only
+.venv/bin/python pocket.py contracts --start 2026-10-13 --end 2026-10-15 --limit 100
+.venv/bin/python pocket.py insiders-live --days 2 --limit 100
+.venv/bin/python pocket.py report
+```
+
+The pilot database defaults to `data/pocket.duckdb`. An adjacent exclusive
+lock admits one writer process; reports use a read-only connection. Recipient
+to public-parent mappings are accepted only from cited rows in
+`config/entity_aliases.csv`. Empty or uncertain mappings remain unresolved.
+
 ```
 py q.py "SELECT tkr, count(*) AS n, sum(amount_low) AS min_dollars
          FROM trades WHERE tkr IS NOT NULL
