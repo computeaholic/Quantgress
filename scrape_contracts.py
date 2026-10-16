@@ -1,46 +1,40 @@
-"""Scrape federal government contract awards from USAspending v2 into DuckDB.
+"""Collect USAspending contract actions and preserve their revision history.
 
-Phase 7 of Quantgress: second non-congressional-trading dataset, same shape
-of work as Phase 6 (scrape_lobbying.py) -- plain JSON REST, no session/CSRF
-gate, no PDFs, and this one needs no API key at all (not even an anon-vs-key
-tier like lda.gov). One POST endpoint returns fully flattened award rows, so
-there's no per-award detail call either.
+The upstream collector stored one mutable award snapshot per
+``generated_internal_id``. That loses the economically important sequence:
+initial award, funded modifications, de-obligations, and later corrections.
+This adapter keeps the original award helper for compatibility, but the Pocket
+pilot writes transaction-level observations to an append-only table.
 
-Usage:
-    py scrape_contracts.py --selftest              # offline checks, no network
-    py scrape_contracts.py --limit 20               # bounded run, last 7 days
-    py scrape_contracts.py --days 30                # last 30 days of contract actions
-    py scrape_contracts.py --start 2026-01-01 --end 2026-01-31 --limit 500
-    py scrape_contracts.py                          # last 7 days, unbounded
-
-Re-running skips generated_internal_ids already stored, so an interrupted run
-resumes -- same pattern as scrape_lobbying.py.
-
-# ponytail: default window is 7 days, not scrape_lobbying.py's current-year.
-# A partial 2026 (Jan-Aug) already has 2.6M contract awards -- orders of
-# magnitude past lobbying's 55-110k/year -- so "current year" would be a
-# quarter-million-request backfill by default. --start/--end opts into that
-# explicitly; nothing here attempts the full 2007-present history.
+No public API or unattended service is required. Run this manually or through
+``pocket.py`` after setting a bounded date window.
 """
 
+from __future__ import annotations
+
 import datetime
+import hashlib
+import json
+import os
 import sys
 import time
 
-import duckdb
 import requests
 
-from schema import DB_PATH
+from pocket_entities import EntityAliasIndex
+from pocket_store import single_writer
+
 
 API = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
-RATE_LIMIT_SECS = 0.3  # no documented limit; this is the community-tested courtesy delay
-PAGE_SIZE = 100  # server hard-caps limit at 100, confirmed live (asked 600, got "above max")
-AWARD_TYPE_CODES = ["A", "B", "C", "D"]  # BPA call, purchase order, delivery order, definitive contract
-# ponytail: 7, not 1 -- measured live, a 1-day window (yesterday->today) came back
-# with 0 results (agencies have a few days' reporting lag before an action shows
-# up), while a 5-day window already had 18k. 7 gives margin without going wide.
+TRANSACTION_API = "https://api.usaspending.gov/api/v2/search/spending_by_transaction/"
+RATE_LIMIT_SECS = 0.3
+PAGE_SIZE = 100
+AWARD_TYPE_CODES = ["A", "B", "C", "D"]
 DAYS_DEFAULT = 7
+DEFAULT_POCKET_DB = "data/pocket.duckdb"
+DEFAULT_ALIAS_FILE = "config/entity_aliases.csv"
 
+# Legacy award-snapshot shape retained for compatibility with the upstream DB.
 TABLE = "gov_contracts"
 COLUMNS = ["generated_internal_id", "award_id", "recipient_name", "recipient_uei",
            "awarding_agency", "awarding_sub_agency", "start_date", "end_date",
@@ -49,8 +43,28 @@ FIELDS = ["Award ID", "Recipient Name", "Recipient UEI", "Awarding Agency",
           "Awarding Sub Agency", "Start Date", "End Date", "Award Amount",
           "Contract Award Type", "Description", "Last Modified Date"]
 
+TRANSACTION_FIELDS = [
+    "Award ID", "Mod", "Action Date", "Action Type", "Award Type",
+    "Recipient Name", "Recipient UEI", "recipient_id", "Transaction Amount",
+    "Transaction Description", "Awarding Agency", "Awarding Sub Agency",
+    "Funding Agency", "Funding Sub Agency",
+]
+
+ACTION_COLUMNS = [
+    "logical_action_id", "observation_hash", "generated_internal_id", "award_id",
+    "modification_number", "action_date", "action_type", "action_kind",
+    "award_type", "obligation_delta", "description", "recipient_name",
+    "recipient_uei", "recipient_id", "awarding_agency", "awarding_sub_agency",
+    "funding_agency", "funding_sub_agency", "record_url", "source_url",
+    "publication_date", "publication_date_status", "first_observed_at",
+    "public_parent_name", "public_parent_ticker", "entity_match_method",
+    "entity_confidence", "entity_evidence_url", "raw_record_json",
+]
+
 
 def ensure_table(con):
+    """Retain the original snapshot table for upstream compatibility."""
+
     con.execute(f"""CREATE TABLE IF NOT EXISTS {TABLE} (
         generated_internal_id VARCHAR PRIMARY KEY, award_id VARCHAR,
         recipient_name VARCHAR, recipient_uei VARCHAR,
@@ -59,48 +73,215 @@ def ensure_table(con):
         contract_award_type VARCHAR, description VARCHAR, last_modified_date VARCHAR)""")
 
 
-def parse_award(a):
-    """Flatten one API result object into a row. Dates arrive as ISO strings
-    (YYYY-MM-DD) already -- unlike the eFD/Clerk MM/DD/YYYY columns, these
-    sort correctly with a plain ORDER BY, no try_strptime needed."""
+def ensure_tables(con):
+    """Create the append-only observation table and current/history views."""
+
+    con.execute("""CREATE TABLE IF NOT EXISTS contract_action_observations (
+        logical_action_id VARCHAR NOT NULL,
+        observation_hash VARCHAR PRIMARY KEY,
+        generated_internal_id VARCHAR NOT NULL,
+        award_id VARCHAR,
+        modification_number VARCHAR,
+        action_date DATE,
+        action_type VARCHAR,
+        action_kind VARCHAR NOT NULL,
+        award_type VARCHAR,
+        obligation_delta DOUBLE,
+        description VARCHAR,
+        recipient_name VARCHAR,
+        recipient_uei VARCHAR,
+        recipient_id VARCHAR,
+        awarding_agency VARCHAR,
+        awarding_sub_agency VARCHAR,
+        funding_agency VARCHAR,
+        funding_sub_agency VARCHAR,
+        record_url VARCHAR NOT NULL,
+        source_url VARCHAR NOT NULL,
+        publication_date DATE,
+        publication_date_status VARCHAR NOT NULL,
+        first_observed_at TIMESTAMPTZ NOT NULL,
+        public_parent_name VARCHAR,
+        public_parent_ticker VARCHAR,
+        entity_match_method VARCHAR,
+        entity_confidence VARCHAR,
+        entity_evidence_url VARCHAR,
+        raw_record_json VARCHAR NOT NULL)""")
+    con.execute("""CREATE OR REPLACE VIEW contract_actions_current AS
+        SELECT * EXCLUDE (observation_rank)
+          FROM (
+            SELECT *, row_number() OVER (
+                PARTITION BY logical_action_id
+                ORDER BY first_observed_at DESC, observation_hash DESC
+            ) AS observation_rank
+              FROM contract_action_observations
+          )
+         WHERE observation_rank = 1""")
+    con.execute("""CREATE OR REPLACE VIEW contract_action_history AS
+        SELECT *,
+               sum(coalesce(obligation_delta, 0)) OVER (
+                   PARTITION BY generated_internal_id
+                   ORDER BY action_date NULLS LAST, modification_number NULLS LAST,
+                            logical_action_id
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               ) AS funded_value_after_action
+          FROM contract_actions_current""")
+
+
+def parse_award(record):
+    """Flatten the original award-level result for compatibility."""
+
     return {
-        "generated_internal_id": a["generated_internal_id"], "award_id": a.get("Award ID"),
-        "recipient_name": a.get("Recipient Name"), "recipient_uei": a.get("Recipient UEI"),
-        "awarding_agency": a.get("Awarding Agency"), "awarding_sub_agency": a.get("Awarding Sub Agency"),
-        "start_date": a.get("Start Date"), "end_date": a.get("End Date"),
-        "award_amount": a.get("Award Amount"), "contract_award_type": a.get("Contract Award Type"),
-        "description": a.get("Description"), "last_modified_date": a.get("Last Modified Date"),
+        "generated_internal_id": record["generated_internal_id"], "award_id": record.get("Award ID"),
+        "recipient_name": record.get("Recipient Name"), "recipient_uei": record.get("Recipient UEI"),
+        "awarding_agency": record.get("Awarding Agency"),
+        "awarding_sub_agency": record.get("Awarding Sub Agency"),
+        "start_date": record.get("Start Date"), "end_date": record.get("End Date"),
+        "award_amount": record.get("Award Amount"),
+        "contract_award_type": record.get("Contract Award Type"),
+        "description": record.get("Description"),
+        "last_modified_date": record.get("Last Modified Date"),
     }
 
 
+def _clean(value):
+    return None if value in (None, "") else value
+
+
+def _amount(value):
+    return None if value in (None, "") else float(value)
+
+
+def _logical_action_id(record):
+    award = record.get("generated_internal_id") or ""
+    modification = _clean(record.get("Mod"))
+    if modification is not None:
+        material = f"{award}|MOD|{modification}"
+    else:
+        material = "|".join([
+            award,
+            str(record.get("Action Date") or ""),
+            str(record.get("Action Type") or ""),
+            str(record.get("Transaction Description") or ""),
+        ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _action_kind(record):
+    action_type = str(record.get("Action Type") or "").upper()
+    description = str(record.get("Action Type Description") or "").upper()
+    modification = str(record.get("Mod") or "").upper()
+    if action_type == "A" or description == "NEW" or modification in {"", "0", "00", "000", "P00000"}:
+        return "INITIAL_AWARD"
+    return "MODIFICATION"
+
+
+def parse_transaction(record, aliases=None):
+    """Normalize one USAspending transaction-search result.
+
+    The transaction endpoint does not expose a transaction publication date.
+    That absence is preserved explicitly instead of substituting action date or
+    ingestion time. ``first_observed_at`` is assigned when the row is stored.
+    """
+
+    aliases = aliases or EntityAliasIndex([])
+    generated_id = record.get("generated_internal_id")
+    if not generated_id:
+        raise ValueError("USAspending transaction missing generated_internal_id")
+    match = aliases.resolve(record.get("Recipient Name"), record.get("Recipient UEI"))
+    return {
+        "logical_action_id": _logical_action_id(record),
+        "generated_internal_id": generated_id,
+        "award_id": _clean(record.get("Award ID")),
+        "modification_number": _clean(record.get("Mod")),
+        "action_date": _clean(record.get("Action Date")),
+        "action_type": _clean(record.get("Action Type")),
+        "action_kind": _action_kind(record),
+        "award_type": _clean(record.get("Award Type")),
+        "obligation_delta": _amount(record.get("Transaction Amount")),
+        "description": _clean(record.get("Transaction Description")),
+        "recipient_name": _clean(record.get("Recipient Name")),
+        "recipient_uei": _clean(record.get("Recipient UEI")),
+        "recipient_id": _clean(record.get("recipient_id")),
+        "awarding_agency": _clean(record.get("Awarding Agency")),
+        "awarding_sub_agency": _clean(record.get("Awarding Sub Agency")),
+        "funding_agency": _clean(record.get("Funding Agency")),
+        "funding_sub_agency": _clean(record.get("Funding Sub Agency")),
+        "record_url": f"https://www.usaspending.gov/award/{generated_id}/",
+        "source_url": TRANSACTION_API,
+        "publication_date": None,
+        "publication_date_status": "NOT_AVAILABLE_FROM_ENDPOINT",
+        "public_parent_name": match.public_parent_name if match else None,
+        "public_parent_ticker": match.ticker if match else None,
+        "entity_match_method": match.match_method if match else None,
+        "entity_confidence": match.confidence if match else "UNRESOLVED",
+        "entity_evidence_url": match.evidence_url if match else None,
+        "raw_record_json": json.dumps(record, sort_keys=True, separators=(",", ":")),
+    }
+
+
+def _observation_hash(row):
+    material = {key: row.get(key) for key in ACTION_COLUMNS
+                if key not in {"observation_hash", "first_observed_at"}}
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def store_transactions(con, rows, observed_at):
+    """Append unseen source versions and return ``(added, unchanged)``."""
+
+    ensure_tables(con)
+    insert_sql = (
+        f"INSERT INTO contract_action_observations ({','.join(ACTION_COLUMNS)}) "
+        f"VALUES ({','.join('?' * len(ACTION_COLUMNS))})"
+    )
+    added = unchanged = 0
+    for source in rows:
+        row = dict(source)
+        row["first_observed_at"] = observed_at
+        row["observation_hash"] = _observation_hash(row)
+        exists = con.execute(
+            "SELECT 1 FROM contract_action_observations WHERE observation_hash = ?",
+            [row["observation_hash"]],
+        ).fetchone()
+        if exists:
+            unchanged += 1
+            continue
+        con.execute(insert_sql, [row.get(column) for column in ACTION_COLUMNS])
+        added += 1
+    return added, unchanged
+
+
 def _session():
-    s = requests.Session()
-    s.headers["User-Agent"] = "quantgress/0.1 (personal research)"
-    return s
+    session = requests.Session()
+    session.headers["User-Agent"] = os.environ.get(
+        "QUANTGRESS_USER_AGENT",
+        "quantgress-pocket/0.1 (computeaholic@users.noreply.github.com)",
+    )
+    return session
 
 
-def _post(s, body, tries=4):
-    """POST with retry -- mirrors scrape_lobbying._get: retries both a bad
-    status code and a connection-level failure (the latter raises before
-    there's a status code to check, and would otherwise kill the whole run)."""
+def _post(session, body, tries=4, url=API):
     for attempt in range(tries):
         try:
-            r = s.post(API, json=body, timeout=30)
+            response = session.post(url, json=body, timeout=30)
         except requests.exceptions.RequestException:
             if attempt == tries - 1:
                 raise
             time.sleep(5 * (attempt + 1))
             continue
-        if r.status_code == 200:
-            return r
+        if response.status_code == 200:
+            return response
+        if 400 <= response.status_code < 500 and response.status_code != 429:
+            response.raise_for_status()
         if attempt == tries - 1:
-            r.raise_for_status()
+            response.raise_for_status()
         time.sleep(5 * (attempt + 1))
 
 
-def list_awards(s, start_date, end_date):
-    """Yield one award result dict at a time for the given date range,
-    most-recently-modified first."""
+def list_awards(session, start_date, end_date):
+    """Original award-snapshot iterator retained for compatibility."""
+
     page = 1
     while True:
         time.sleep(RATE_LIMIT_SECS)
@@ -110,39 +291,65 @@ def list_awards(s, start_date, end_date):
                         "time_period": [{"start_date": start_date, "end_date": end_date}]},
             "fields": FIELDS,
         }
-        data = _post(s, body).json()
+        data = _post(session, body).json()
         yield from data["results"]
         if not data["page_metadata"]["hasNext"]:
             break
         page += 1
 
 
-def main(start_date, end_date, limit=None):
-    con = duckdb.connect(DB_PATH)
-    ensure_table(con)
-    done = {r[0] for r in con.execute(f"SELECT generated_internal_id FROM {TABLE}").fetchall()}
+def list_transactions(session, start_date, end_date):
+    """Yield transaction-level contract actions in deterministic page order."""
 
-    s = _session()
-    added = skipped = 0
-    insert_sql = (f"INSERT INTO {TABLE} ({','.join(COLUMNS)}) "
-                  f"VALUES ({','.join('?' * len(COLUMNS))})")
-    print(f"{start_date} to {end_date}:")
-    for a in list_awards(s, start_date, end_date):
-        if limit is not None and added >= limit:
+    page = 1
+    while True:
+        time.sleep(RATE_LIMIT_SECS)
+        body = {
+            "limit": PAGE_SIZE,
+            "page": page,
+            "sort": "Action Date",
+            "order": "asc",
+            "filters": {
+                "award_type_codes": AWARD_TYPE_CODES,
+                "time_period": [{"start_date": start_date, "end_date": end_date}],
+            },
+            "fields": TRANSACTION_FIELDS,
+        }
+        data = _post(session, body, url=TRANSACTION_API).json()
+        yield from data["results"]
+        if not data["page_metadata"]["hasNext"]:
             break
-        if a["generated_internal_id"] in done:
-            skipped += 1
-            continue
-        row = parse_award(a)
-        con.execute(insert_sql, [row[c] for c in COLUMNS])
-        done.add(row["generated_internal_id"])
-        added += 1
-        amt = f" ${row['award_amount']:,.0f}" if row["award_amount"] else ""
-        print(f"  {row['recipient_name']} — {row['contract_award_type']}{amt}")
+        page += 1
 
-    total = con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0]
-    print(f"\n{total} gov contract awards in {DB_PATH}; this run added {added},"
-          f" skipped {skipped} already-stored")
+
+def collect(con, start_date, end_date, limit=None, aliases=None, observed_at=None):
+    aliases = aliases or EntityAliasIndex([])
+    observed_at = observed_at or datetime.datetime.now(datetime.timezone.utc).isoformat()
+    added = unchanged = seen = 0
+    batch = []
+    for record in list_transactions(_session(), start_date, end_date):
+        batch.append(parse_transaction(record, aliases))
+        seen += 1
+        if len(batch) >= PAGE_SIZE:
+            batch_added, batch_unchanged = store_transactions(con, batch, observed_at)
+            added += batch_added
+            unchanged += batch_unchanged
+            batch.clear()
+        if limit is not None and seen >= limit:
+            break
+    if batch:
+        batch_added, batch_unchanged = store_transactions(con, batch, observed_at)
+        added += batch_added
+        unchanged += batch_unchanged
+    return added, unchanged
+
+
+def main(start_date, end_date, limit=None, db_path=DEFAULT_POCKET_DB, alias_file=DEFAULT_ALIAS_FILE):
+    aliases = EntityAliasIndex.from_csv(alias_file)
+    with single_writer(db_path) as con:
+        added, unchanged = collect(con, start_date, end_date, limit=limit, aliases=aliases)
+        total = con.execute("SELECT count(*) FROM contract_action_observations").fetchone()[0]
+    print(f"{total} contract-action observations in {db_path}; added {added}, unchanged {unchanged}")
 
 
 def selftest():
@@ -158,30 +365,36 @@ def selftest():
     assert row["generated_internal_id"] == "CONT_AWD_ABC123_9700_-NONE-_-NONE-"
     assert row["recipient_name"] == "ACME DEFENSE CORP" and row["recipient_uei"] == "ZE6ZM6NKSV43"
     assert row["award_amount"] == 1250000.0
-    assert row["start_date"] == "2026-08-01"  # ISO already, no parsing needed
+    assert row["start_date"] == "2026-08-01"
 
-    # defensive: some awards genuinely lack a description or a recipient UEI
     bare = dict(sample, Description=None, **{"Recipient UEI": None})
     row2 = parse_award(bare)
     assert row2["description"] is None and row2["recipient_uei"] is None
 
-    # _post retries a connection-level failure, not just a bad status code
+    transaction = {
+        "generated_internal_id": sample["generated_internal_id"], "Award ID": "ABC123",
+        "Mod": "P00001", "Action Date": "2026-08-12", "Action Type": "C",
+        "Award Type": "DEFINITIVE CONTRACT", "Recipient Name": "ACME DEFENSE CORP",
+        "Recipient UEI": "ZE6ZM6NKSV43", "Transaction Amount": "250000.00",
+    }
+    parsed = parse_transaction(transaction)
+    assert parsed["action_kind"] == "MODIFICATION" and parsed["obligation_delta"] == 250000.0
+
     class _FlakyThenOK:
         calls = 0
 
-        def post(self, *a, **k):
+        def post(self, *args, **kwargs):
             _FlakyThenOK.calls += 1
             if _FlakyThenOK.calls < 3:
                 raise requests.exceptions.ConnectionError("simulated DNS blip")
             return type("R", (), {"status_code": 200})()
 
-    real_sleep, time.sleep = time.sleep, lambda _: None  # skip the backoff delay in-test
+    real_sleep, time.sleep = time.sleep, lambda _: None
     try:
-        r = _post(_FlakyThenOK(), {}, tries=4)
+        response = _post(_FlakyThenOK(), {}, tries=4)
     finally:
         time.sleep = real_sleep
-    assert r.status_code == 200 and _FlakyThenOK.calls == 3
-
+    assert response.status_code == 200 and _FlakyThenOK.calls == 3
     print("selftest ok")
 
 
@@ -197,5 +410,11 @@ if __name__ == "__main__":
         days = int(arg("--days", DAYS_DEFAULT))
         start = arg("--start", (today - datetime.timedelta(days=days)).isoformat())
         end = arg("--end", today.isoformat())
-        n = arg("--limit")
-        main(start, end, int(n) if n else None)
+        count = arg("--limit")
+        main(
+            start,
+            end,
+            int(count) if count else None,
+            db_path=arg("--db", DEFAULT_POCKET_DB),
+            alias_file=arg("--aliases", DEFAULT_ALIAS_FILE),
+        )
