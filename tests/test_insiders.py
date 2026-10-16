@@ -1,8 +1,15 @@
+import contextlib
 import io
+import os
+import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
+import duckdb
+
+import scrape_insiders
 from scrape_insiders import classify_transaction, iter_bulk_quarter, parse_form4_xml
 
 
@@ -51,6 +58,14 @@ class InsiderClassificationTests(unittest.TestCase):
         self.assertFalse(discretionary)
         self.assertEqual(confidence, "HIGH")
 
+    def test_sec_session_requires_environment_identity(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "QUANTGRESS_SEC_USER_AGENT"):
+                scrape_insiders._session()
+        identity = "Example Research contact@example.com"
+        with mock.patch.dict(os.environ, {"QUANTGRESS_SEC_USER_AGENT": identity}):
+            self.assertEqual(scrape_insiders._session().headers["User-Agent"], identity)
+
 
 class InsiderBulkStreamingTests(unittest.TestCase):
     def make_zip(self):
@@ -80,6 +95,52 @@ class InsiderBulkStreamingTests(unittest.TestCase):
         self.assertEqual(first["transaction_category"], "OPEN_MARKET_PURCHASE")
         with self.assertRaises(ValueError):
             next(rows)
+
+    def test_bounded_collection_does_not_overrun_on_multirow_filing(self):
+        rows = [{"trans_seq": number} for number in range(5)]
+        self.assertEqual(
+            scrape_insiders._bounded_rows(rows, already_seen=98, limit=100),
+            rows[:2],
+        )
+
+    def test_live_limit_is_source_stable_on_rerun(self):
+        def fake_parse(_xml, filed_date, accession_number=None, source_url=None,
+                       observed_at=None):
+            rows = []
+            for trans_seq in range(2):
+                row = {column: None for column in scrape_insiders.COLUMNS}
+                row.update({
+                    "accession_number": accession_number,
+                    "trans_seq": trans_seq,
+                    "filed_date": filed_date,
+                    "publication_date": filed_date,
+                    "first_observed_at": observed_at,
+                    "source_url": source_url,
+                    "ticker": "TEST",
+                })
+                rows.append(row)
+            return rows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "pocket.duckdb"
+            patches = (
+                mock.patch.object(scrape_insiders, "_session", return_value=object()),
+                mock.patch.object(scrape_insiders, "list_daily_form4",
+                                  return_value=iter(["one.txt", "two.txt"])),
+                mock.patch.object(scrape_insiders, "fetch_filing", return_value="submission"),
+                mock.patch.object(scrape_insiders, "extract_xml", return_value="xml"),
+                mock.patch.object(scrape_insiders, "parse_form4_xml", side_effect=fake_parse),
+                mock.patch.object(scrape_insiders.time, "sleep", return_value=None),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    scrape_insiders.main_live(days=1, limit=3, db_path=db_path)
+                    scrape_insiders.main_live(days=1, limit=3, db_path=db_path)
+            con = duckdb.connect(str(db_path), read_only=True)
+            try:
+                self.assertEqual(con.execute("SELECT count(*) FROM insider_trades").fetchone()[0], 3)
+            finally:
+                con.close()
 
 
 if __name__ == "__main__":

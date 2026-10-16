@@ -430,11 +430,13 @@ def parse_form4_xml(xml_text, filed_date, accession_number=None, source_url=None
 # --------------------------------------------------------------- networking
 
 def _session():
+    identity = os.environ.get("QUANTGRESS_SEC_USER_AGENT", "").strip()
+    if not identity:
+        raise RuntimeError(
+            "QUANTGRESS_SEC_USER_AGENT is required for identified SEC requests"
+        )
     s = requests.Session()
-    s.headers["User-Agent"] = os.environ.get(
-        "QUANTGRESS_SEC_USER_AGENT",
-        "quantgress-pocket/0.1 (computeaholic@users.noreply.github.com)",
-    )
+    s.headers["User-Agent"] = identity
     return s
 
 
@@ -489,6 +491,13 @@ def _insert_rows(con, done, rows):
     return added, skipped
 
 
+def _bounded_rows(rows, already_seen, limit):
+    """Keep a multi-transaction filing inside the caller's row limit."""
+    if limit is None:
+        return rows
+    return rows[:max(limit - already_seen, 0)]
+
+
 def main_bulk(quarter=None, limit=None, db_path=DEFAULT_POCKET_DB):
     s = _session()
     quarters = list_quarters(s)
@@ -505,14 +514,15 @@ def main_bulk(quarter=None, limit=None, db_path=DEFAULT_POCKET_DB):
         sys.exit(f"could not download {url}")
 
     observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    added = skipped = 0
+    added = skipped = processed = 0
     with single_writer(db_path) as con:
         ensure_table(con)
         done = {(row[0], row[1]) for row in con.execute(
             f"SELECT accession_number, trans_seq FROM {TABLE}").fetchall()}
         for row in iter_bulk_quarter(r.content, observed_at=observed_at):
-            if limit is not None and added >= limit:
+            if limit is not None and processed >= limit:
                 break
+            processed += 1
             new_rows, duplicate_count = _insert_rows(con, done, [row])
             added += len(new_rows)
             skipped += duplicate_count
@@ -526,7 +536,7 @@ def main_bulk(quarter=None, limit=None, db_path=DEFAULT_POCKET_DB):
 
 def main_live(days=DAYS_DEFAULT, limit=None, db_path=DEFAULT_POCKET_DB):
     s = _session()
-    added = skipped = 0
+    added = skipped = processed = 0
     today = datetime.date.today()
     observed_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     with single_writer(db_path) as con:
@@ -534,13 +544,13 @@ def main_live(days=DAYS_DEFAULT, limit=None, db_path=DEFAULT_POCKET_DB):
         done = {(row[0], row[1]) for row in con.execute(
             f"SELECT accession_number, trans_seq FROM {TABLE}").fetchall()}
         for delta in range(days):
-            if limit is not None and added >= limit:
+            if limit is not None and processed >= limit:
                 break
             date = today - datetime.timedelta(days=delta)
             filings = list(list_daily_form4(s, date))
             print(f"{date}: {len(filings)} Form 4 filings")
             for path in filings:
-                if limit is not None and added >= limit:
+                if limit is not None and processed >= limit:
                     break
                 time.sleep(RATE_LIMIT_SECS)
                 txt = fetch_filing(s, path)
@@ -557,6 +567,8 @@ def main_live(days=DAYS_DEFAULT, limit=None, db_path=DEFAULT_POCKET_DB):
                     source_url="https://www.sec.gov/Archives/" + path,
                     observed_at=observed_at,
                 )
+                rows = _bounded_rows(rows, already_seen=processed, limit=limit)
+                processed += len(rows)
                 new_rows, duplicate_count = _insert_rows(con, done, rows)
                 added += len(new_rows)
                 skipped += duplicate_count

@@ -25,6 +25,7 @@ python3.12 -m venv .venv
 .venv/bin/python pocket.py selftest
 
 # Manual, bounded collection only
+export QUANTGRESS_SEC_USER_AGENT='Organization research contact@example.com'
 .venv/bin/python pocket.py contracts --start 2026-10-13 --end 2026-10-15 --limit 100
 .venv/bin/python pocket.py insiders-live --days 2 --limit 100
 .venv/bin/python pocket.py report
