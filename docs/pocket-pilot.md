@@ -30,8 +30,9 @@ python3.12 -m venv .venv
 The reduced requirements intentionally omit the API server, paid/account-gated
 feeds, Reddit, Transformers, Torch, and unrelated parsers.
 
-For SEC access, set a descriptive contact header if the default GitHub contact
-does not meet the operator's policy:
+SEC collection requires an operator-controlled descriptive contact identity.
+There is no tracked fallback because an undeclared or placeholder identity can
+be rejected and must not be mistaken for a source outage:
 
 ```bash
 export QUANTGRESS_SEC_USER_AGENT='Organization research contact@example.com'
@@ -57,9 +58,8 @@ USAspending supports the equivalent `QUANTGRESS_USER_AGENT` override.
 .venv/bin/python pocket.py report --db data/pocket.duckdb
 ```
 
-Do not schedule these commands yet. Collection remains manual and bounded until
-both sources pass repeated freshness, recovery, and resource checks from the
-actual deployment network.
+Do not schedule these commands. Qualification covers manual local V1 only;
+unattended collection and Daily CIO consumption remain separate approval gates.
 
 ## Evidence model
 
