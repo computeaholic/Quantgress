@@ -5,6 +5,7 @@
 - **Experiment branch:** `codex/pocket-evidence-value-pilot`
 - **Baseline cutoff:** 2026-10-15 09:01 America/Chicago
 - **Evidence cutoff:** 2026-10-15 23:14 America/Chicago
+- **Publication correction:** Private research and account-context passages in the earlier report text have been removed; source-backed observations and technical outcomes are retained.
 **Final disposition:** **`VALUE_DEMONSTRATED` — narrow and source-specific.**
 
 ## Executive conclusion
@@ -64,7 +65,7 @@ The ignored experiment database was 23 MB. Collection used free official endpoin
 
 ## Public research comparison boundary
 
-This report describes public source data, technical behavior, and cited issuer evidence. It does not state personal holdings, balances, orders, watchlist membership, internal routing, or prior private knowledge. An absent baseline note is not evidence that an event was previously unknown.
+This report describes public source data, technical behavior, and cited issuer evidence. An earlier version included non-public investment-research and account-context material; those passages have been removed from this current text. The public comparison makes no claim about an individual's holdings, balances, orders, watchlist membership, internal routing, or prior private knowledge. An absent baseline note is not evidence that an event was previously unknown.
 
 ## Questions supported by public evidence
 
@@ -145,4 +146,4 @@ The next phase should fail closed on an incomplete date window and should measur
 
 **`VALUE_DEMONSTRATED`**, narrowly. Quantgress improved event discovery by surfacing ALMS, BORR, and CXM for focused research and by classifying QVCG and routine Form 4 noise conservatively. It did not establish an investable signal, prove alpha, or demonstrate USAspending investment value. The result supports a separately qualified SEC-first unattended pilot; it does not authorize deployment.
 
-Validation at the report cutoff: focused deterministic suite **19/19 passed** after the regression fix; idempotent live, archive, and complete-day collection reruns added **0** duplicate rows; local DuckDB remained ignored. Collectors did not mutate Pocket or broker systems. No credentials, collected database, scheduler, or service configuration are included here.
+Validation at the report cutoff: focused deterministic suite **19/19 passed** after the regression fix; idempotent live, archive, and complete-day collection reruns added **0** duplicate rows; local DuckDB remained ignored. Collectors did not mutate Pocket or broker systems. An earlier report revision did publish private account and research context; that material has been removed from this current text. No credentials, collected database, scheduler, or service configuration are included here.
